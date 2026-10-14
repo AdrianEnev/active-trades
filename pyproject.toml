@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=70", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "active-trades"
+version = "0.1.0"
+description = "Terminal tracker for Lighter and BingX perpetual positions and limit orders."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "rich>=13.7",
+  "lighter-sdk>=0.1.0",
+  "websockets>=15.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+active-trades = "active_trades.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

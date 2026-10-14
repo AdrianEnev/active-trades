@@ -1,0 +1,31 @@
+# Credentials stay local. Only the blank configuration template is published.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local account state and logs.
+state/
+*.log
+
+# Virtual environments, Python caches, and generated package metadata.
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Editor and operating-system files.
+.DS_Store
+.idea/
+.vscode/
