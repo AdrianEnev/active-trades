@@ -46,6 +46,23 @@ class TestLighterApiParsing(TestCase):
         self.assertEqual(order.side, "sell")
         self.assertEqual(order.trigger_price, Decimal("175"))
 
+    def test_stop_order_is_ask_overrides_deprecated_side(self):
+        for is_ask, deprecated_side, expected in ((True, "buy", "sell"), (False, "sell", "buy")):
+            with self.subTest(is_ask=is_ask):
+                order = stop_order_from_dict(
+                    {
+                        "market_index": 3,
+                        "is_ask": is_ask,
+                        "side": deprecated_side,
+                        "trigger_price": "175",
+                        "reduce_only": True,
+                        "type": "stop-loss",
+                        "status": "pending",
+                    },
+                    account_index=9,
+                )
+                self.assertEqual(order.side, expected)
+
     def test_position_preserves_zero_unrealized_pnl(self):
         for value in (0, "0", "0.00"):
             with self.subTest(value=value):

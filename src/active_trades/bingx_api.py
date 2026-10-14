@@ -187,6 +187,7 @@ def limit_orders_from_dicts(
             or remaining <= 0
         ):
             continue
+        stop_loss, stop_loss_quantity = _attached_stop_loss(raw.get("stopLoss"))
         orders.append(
             LimitOrder(
                 account_index=account_index,
@@ -200,6 +201,8 @@ def limit_orders_from_dicts(
                 reduce_only=_is_reducing_order(raw),
                 raw=raw,
                 exchange="bingx",
+                stop_loss=stop_loss,
+                stop_loss_quantity=stop_loss_quantity,
             )
         )
     return orders
@@ -323,6 +326,28 @@ def _remaining_amount(raw: dict[str, Any]) -> Decimal | None:
     if original < 0 or executed is None or executed < 0:
         return None
     return original - executed
+
+
+def _attached_stop_loss(value: Any) -> tuple[Decimal | None, Decimal | None]:
+    # openOrders returns the entry's attached SL as an object. Also accept the
+    # JSON serialization used when supplying stopLoss to the order endpoint.
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return None, None
+    if not isinstance(value, dict) or _text(value, "type") not in {"STOP_MARKET", "STOP"}:
+        return None, None
+    price = _decimal(value.get("stopPrice"))
+    if price is None or price <= 0:
+        return None, None
+    if "quantity" not in value:
+        return price, None
+    quantity = _decimal(value["quantity"])
+    if quantity is None or quantity < 0:
+        return None, None
+    # The documented attachment default is zero: follow the entry's size.
+    return price, quantity if quantity > 0 else None
 
 
 def _order_created_at(raw: dict[str, Any]) -> datetime | None:

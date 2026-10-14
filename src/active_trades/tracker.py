@@ -194,6 +194,7 @@ class ActiveTradesTracker:
                     limit_orders=tuple(limit_orders),
                     orders_state=orders_state,
                     pnl_collected_at=collected_at,
+                    stop_orders=tuple(stop_orders),
                 )
             )
 
@@ -284,6 +285,7 @@ class ActiveTradesTracker:
             orders_state=orders_state,
             pnl_collected_at=collected_at if positions_state == "available" else None,
             positions_state=positions_state,
+            stop_orders=tuple(stops),
         )
 
     def _fetch_account_info(self, account_index: int) -> AccountInfo:

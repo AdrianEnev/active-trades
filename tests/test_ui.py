@@ -410,6 +410,133 @@ def test_total_upnl_tracks_updated_and_closed_positions_on_rerender() -> None:
         assert expected in output.getvalue().partition("POSITIONS ·")[0]
 
 
+def _risk_snapshot() -> TrackerSnapshot:
+    snapshot = _mixed_snapshot()
+    accounts = []
+    for account in snapshot.accounts:
+        trades = tuple(replace(
+            trade,
+            stop_loss=(
+                trade.position.avg_entry_price - trade.risk_usd
+                if trade.position.side == "long"
+                else trade.position.avg_entry_price + trade.risk_usd
+            ),
+        ) for trade in account.trades)
+        limits = tuple(replace(
+            order,
+            market_id=99 if order.exchange == "lighter" else "SOL-USDT",
+            price=Decimal("100") if order.side == "buy" else Decimal("150"),
+            remaining_base_amount=Decimal("2") if order.side == "buy" else Decimal("2.5"),
+            reduce_only=False,
+            stop_loss=Decimal("90") if order.side == "buy" else Decimal("160"),
+            stop_loss_quantity=Decimal("2") if order.side == "buy" else Decimal("2.5"),
+        ) for order in account.limit_orders)
+        accounts.append(replace(account, trades=trades, limit_orders=limits))
+    return replace(snapshot, accounts=tuple(accounts))
+
+
+@pytest.mark.parametrize("width", [28, 45, 100])
+def test_general_header_shows_position_and_additional_limit_risk_across_sources(width: int) -> None:
+    snapshot = _risk_snapshot()
+    plain = render_plain(snapshot, refresh_seconds=15, width=width)
+    output = StringIO()
+    console = Console(file=output, width=width, color_system=None)
+    console.print(render_snapshot(snapshot, refresh_seconds=15))
+
+    for rendered in (plain, output.getvalue()):
+        header = _content_text(rendered.partition("POSITIONS ·")[0])
+        assert "POSITION RISK $27.27" in header
+        assert "LIMIT RISK $45.00" in header
+        assert "All limit fills → SL" in header
+        assert "Risk incomplete" not in header
+        assert max(map(len, rendered.splitlines())) <= width
+        assert "…" not in rendered
+    segments = list(console.render(render_snapshot(snapshot, refresh_seconds=15)))
+    for amount in ("$27.27", "$45.00"):
+        assert any(
+            segment.text.strip() == amount and segment.style.bold and segment.style.color.name == "white"
+            for segment in segments
+        )
+    assert any(segment.text.strip() == "All limit fills → SL" and segment.style.dim for segment in segments)
+
+
+@pytest.mark.parametrize(
+    ("case", "position_label", "limit_label"),
+    [
+        ("missing-position-sl", "≥$16.06", "$45.00"),
+        ("missing-limit-sl", "$27.27", "≥$25.00"),
+        ("all-risk-unknown", "n/a", "n/a"),
+        ("orders-disabled", "$0.00", "n/a"),
+        ("source-unavailable", "≥$23.02", "≥$20.00"),
+        ("discovery-incomplete", "≥$27.27", "≥$45.00"),
+    ],
+)
+def test_risk_header_labels_incomplete_or_unavailable_estimates(
+    case: str, position_label: str, limit_label: str,
+) -> None:
+    snapshot = _risk_snapshot()
+    if case == "missing-position-sl":
+        account = snapshot.accounts[0]
+        missing = replace(account.trades[0], risk_usd=None, stop_loss=None, risk_state="missing")
+        snapshot = replace(snapshot, accounts=(replace(account, trades=(missing, *account.trades[1:])), *snapshot.accounts[1:]))
+    elif case == "missing-limit-sl":
+        account = snapshot.accounts[0]
+        missing = replace(account.limit_orders[0], stop_loss=None, stop_loss_quantity=None)
+        snapshot = replace(snapshot, accounts=(replace(account, limit_orders=(missing,)), *snapshot.accounts[1:]))
+    elif case == "all-risk-unknown":
+        snapshot = replace(snapshot, accounts=tuple(replace(
+            account,
+            trades=tuple(replace(trade, risk_usd=None, stop_loss=None, risk_state="missing") for trade in account.trades),
+            limit_orders=tuple(replace(order, stop_loss=None, stop_loss_quantity=None) for order in account.limit_orders),
+        ) for account in snapshot.accounts))
+    elif case == "orders-disabled":
+        snapshot = replace(_order_snapshot(), accounts=(replace(
+            _order_snapshot().accounts[0], limit_orders=(), orders_state="disabled",
+        ),))
+    elif case == "source-unavailable":
+        snapshot = replace(snapshot, accounts=(*snapshot.accounts[:-1], replace(
+            snapshot.accounts[-1], trades=(), limit_orders=(), positions_state="unavailable", orders_state="unavailable",
+        )))
+    elif case == "discovery-incomplete":
+        snapshot = replace(snapshot, accounts_complete=False)
+    plain = render_plain(snapshot, refresh_seconds=15, width=28)
+    output = StringIO()
+    console = Console(file=output, width=28, color_system=None)
+    console.print(render_snapshot(snapshot, refresh_seconds=15))
+
+    for rendered in (plain, output.getvalue()):
+        header = _content_text(rendered.partition("POSITIONS ·")[0])
+        assert f"POSITION RISK {position_label}" in header
+        assert f"LIMIT RISK {limit_label}" in header
+        assert "Risk incomplete: SL/data" in header
+        assert max(map(len, rendered.splitlines())) <= 28
+    segments = list(console.render(render_snapshot(snapshot, refresh_seconds=15)))
+    for label in (position_label, limit_label):
+        if label.startswith("≥") or label == "n/a":
+            assert any(
+                segment.text.strip() == label and segment.style.bold and segment.style.color.name == "yellow"
+                for segment in segments
+            )
+
+
+def test_reducing_limits_and_empty_positions_have_confirmed_zero_risk() -> None:
+    snapshot = _order_snapshot()
+    output = StringIO()
+    console = Console(file=output, width=45, color_system=None)
+    console.print(render_snapshot(snapshot, refresh_seconds=15))
+
+    for rendered in (render_plain(snapshot, refresh_seconds=15, width=45), output.getvalue()):
+        header = _content_text(rendered.partition("POSITIONS ·")[0])
+        assert "POSITION RISK $0.00" in header
+        assert "LIMIT RISK $0.00" in header
+        assert "Risk incomplete" not in header
+    segments = list(console.render(render_snapshot(snapshot, refresh_seconds=15)))
+    assert sum(
+        segment.text.strip() == "$0.00" and segment.style.bold and segment.style.color.name == "green"
+        for segment in segments
+    ) == 2
+
+
 @pytest.mark.parametrize("width", [28, 32, 45, 100])
 def test_both_exchanges_share_exactly_two_tables_with_source_on_every_row(width: int) -> None:
     snapshot = _mixed_snapshot()
@@ -538,6 +665,9 @@ def test_live_pager_keeps_header_and_navigation_fixed_at_45_by_24() -> None:
         assert "ACTIVE TRADES" in rendered.splitlines()[0]
         assert "Data 15s · UPNL 0.5s" in rendered
         assert "TOTAL UPNL" in rendered
+        assert "POSITION RISK" in rendered
+        assert "LIMIT RISK" in rendered
+        assert "All limit fills → SL" in rendered
         assert "+$120.95" in rendered
         assert f"Page {page}/{page_count}" in rendered
         assert "←/→ n/p · q quit" in rendered.splitlines()[-1]
@@ -590,6 +720,8 @@ def test_mixed_exchange_pager_preserves_every_row_and_both_refresh_cadences() ->
         assert rendered[:header_height] == complete[:header_height]
         assert "Lighter 15s · UPNL 0.5s" in "\n".join(rendered[:header_height])
         assert "BingX REST 15s" in "\n".join(rendered[:header_height])
+        for metric in ("TOTAL UPNL", "POSITION RISK", "LIMIT RISK", "All limit fills → SL"):
+            assert metric in "\n".join(rendered[:header_height])
         body.extend(rendered[header_height:-1])
     assert body[: len(complete) - header_height] == complete[header_height:]
     assert _render_dashboard_page(snapshot, page_count) == _render_dashboard_page(snapshot, 0)

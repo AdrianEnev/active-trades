@@ -8,6 +8,7 @@ from textwrap import wrap
 from typing import Any
 
 from active_trades.models import AccountSnapshot, ActiveTrade, LimitOrder, TrackerSnapshot
+from active_trades.risk import limit_risk_total, position_risk_total
 
 TradeRow = tuple[ActiveTrade, str]
 OrderRow = tuple[LimitOrder, str]
@@ -170,9 +171,18 @@ def render_plain(
         lines.append(f"Updated {_fmt_datetime(snapshot.collected_at, seconds=True)}")
     lines.extend(_cadence_lines(snapshot, refresh_seconds, pnl_refresh_seconds))
     total_pnl, incomplete = _total_pnl(snapshot)
-    lines.extend(("", f"TOTAL UPNL  {_fmt_pnl(total_pnl)}"))
+    lines.extend(("", f"{'TOTAL UPNL':<13}  {_fmt_pnl(total_pnl)}"))
     if incomplete:
         lines.append(_total_pnl_note(total_pnl))
+    position_risk, positions_incomplete = position_risk_total(snapshot)
+    limit_risk, limits_incomplete = limit_risk_total(snapshot)
+    lines.extend((
+        f"POSITION RISK  {_risk_total_label(position_risk, positions_incomplete)}",
+        f"{'LIMIT RISK':<13}  {_risk_total_label(limit_risk, limits_incomplete)}",
+        "All limit fills → SL",
+    ))
+    if positions_incomplete or limits_incomplete:
+        lines.append("Risk incomplete: SL/data")
     notices = _notices(snapshot)
     for notice in notices:
         lines.extend(f"! {part}" for part in wrap(notice, width=max(10, width - 2)))
@@ -236,7 +246,7 @@ def _header_panel(
     )
     cadences = [Text(line, style="dim") for line in _cadence_lines(snapshot, refresh_seconds, pnl_refresh_seconds)]
     return Panel(
-        Group(first_line, second_line, *cadences, Text(""), _total_pnl_summary(snapshot)),
+        Group(first_line, second_line, *cadences, Text(""), _total_pnl_summary(snapshot), _risk_summary(snapshot)),
         title="ACTIVE TRADES",
         title_align="left",
         box=box.ROUNDED,
@@ -269,11 +279,38 @@ def _total_pnl_note(total: Decimal | None) -> str:
 def _total_pnl_summary(snapshot: TrackerSnapshot) -> Any:
     total, incomplete = _total_pnl(snapshot)
     contents = [Text.assemble(
-        ("TOTAL UPNL  ", "bold"),
+        (f"{'TOTAL UPNL':<13}  ", "bold"),
         (_fmt_pnl(total), f"bold {_pnl_style(total)}"),
     )]
     if incomplete:
         contents.append(Text(_total_pnl_note(total), style="yellow"))
+    return Group(*contents)
+
+
+def _risk_total_label(total: Decimal | None, incomplete: bool) -> str:
+    return f"{'≥' if incomplete and total is not None else ''}{_fmt_money(total)}"
+
+
+def _risk_total_style(total: Decimal | None, incomplete: bool) -> str:
+    return "yellow" if incomplete or total is None else "green" if total == 0 else "white"
+
+
+def _risk_summary(snapshot: TrackerSnapshot) -> Any:
+    position_risk, positions_incomplete = position_risk_total(snapshot)
+    limit_risk, limits_incomplete = limit_risk_total(snapshot)
+    contents = [
+        Text.assemble(
+            (f"{label:<13}  ", "bold"),
+            (_risk_total_label(total, incomplete), f"bold {_risk_total_style(total, incomplete)}"),
+        )
+        for label, total, incomplete in (
+            ("POSITION RISK", position_risk, positions_incomplete),
+            ("LIMIT RISK", limit_risk, limits_incomplete),
+        )
+    ]
+    contents.append(Text("All limit fills → SL", style="dim"))
+    if positions_incomplete or limits_incomplete:
+        contents.append(Text("Risk incomplete: SL/data", style="yellow"))
     return Group(*contents)
 
 

@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 from active_trades.bingx_api import BingxApiError, BingxAuthUnavailable
 from active_trades.lighter_api import AuthUnavailable, LighterApiError
 from active_trades.models import AccountInfo, AccountSnapshot, ActiveTrade, LimitOrder, Position, StopOrder, TrackerSnapshot
-from active_trades.risk import find_protective_stop
+from active_trades.risk import find_protective_stop, limit_risk_total, position_risk_total
 from active_trades.settings import Settings
 from active_trades.tracker import ActiveTradesTracker
 from active_trades.ui import render_plain
@@ -318,6 +318,37 @@ class TestTracker(TestCase):
 
 
 class TestBingxTracker(TestCase):
+    def test_risk_totals_use_retained_lighter_children_and_bingx_attached_stops(self):
+        with TemporaryDirectory() as tmp:
+            lighter = FakeClient()
+            stop = {**lighter.fetch_active_orders(1, "auth")[0], "remaining_base_amount": "0.2"}
+            entry = {
+                "market_index": 2, "type": "limit", "status": "open", "is_ask": False,
+                "price": "2000", "remaining_base_amount": "0.5", "initial_base_amount": "0.5", "order_id": 11,
+            }
+            child = {
+                "market_index": 2, "type": "stop-loss", "status": "pending", "is_ask": True,
+                "trigger_price": "1900", "remaining_base_amount": "0", "reduce_only": True,
+                "parent_order_id": 11, "trigger_status": "parent-order",
+            }
+            bingx = fake_bingx(orders=[bingx_stop(), {
+                **bingx_limit(), "stopLoss": {"type": "STOP_MARKET", "stopPrice": "1950", "quantity": 0},
+            }])
+            with patch.object(lighter, "fetch_active_orders", return_value=[stop, entry, child]):
+                snapshot = ActiveTradesTracker(
+                    make_settings(Path(tmp) / "state.json"), client=lighter,
+                    auth_provider=FakeAuthProvider(), bingx_client=bingx,
+                ).collect_snapshot()
+
+            self.assertTrue(any(
+                (stop.raw or {}).get("trigger_status") == "parent-order"
+                for stop in snapshot.accounts[0].stop_orders
+            ))
+            self.assertEqual(len(snapshot.accounts[1].stop_orders), 1)
+            self.assertEqual(snapshot.accounts[1].limit_orders[0].stop_loss, Decimal("1950"))
+            self.assertEqual(position_risk_total(snapshot), (Decimal("800"), False))
+            self.assertEqual(limit_risk_total(snapshot), (Decimal("125"), False))
+
     def test_snapshot_combines_positions_and_limits_from_both_exchanges(self):
         with TemporaryDirectory() as tmp:
             lighter = FakeClient()

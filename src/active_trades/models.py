@@ -83,6 +83,8 @@ class LimitOrder:
     reduce_only: bool = False
     raw: dict[str, Any] | None = None
     exchange: str = "lighter"
+    stop_loss: Decimal | None = None
+    stop_loss_quantity: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -117,6 +119,7 @@ class AccountSnapshot:
     orders_state: str = "available"
     pnl_collected_at: datetime | None = None
     positions_state: str = "available"
+    stop_orders: tuple[StopOrder, ...] = ()
 
 
 @dataclass(frozen=True)

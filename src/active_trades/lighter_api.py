@@ -409,11 +409,11 @@ def stop_order_from_dict(raw: dict[str, Any], *, account_index: int) -> StopOrde
     if market_id is None or trigger_price is None:
         return None
 
-    side = str(raw.get("side") or "").lower()
-    if not side:
-        is_ask = raw.get("is_ask")
-        if isinstance(is_ask, bool):
-            side = "sell" if is_ask else "buy"
+    # SDK objects may populate the deprecated side field with its buy default.
+    is_ask = raw.get("is_ask")
+    side = (
+        "sell" if is_ask else "buy"
+    ) if isinstance(is_ask, bool) else str(raw.get("side") or "").strip().lower()
 
     return StopOrder(
         account_index=account_index,

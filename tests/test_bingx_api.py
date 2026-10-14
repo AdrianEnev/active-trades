@@ -254,6 +254,59 @@ class TestBingxParsing(TestCase):
         self.assertIsNone(order.created_at)
         self.assertFalse(order.reduce_only)
 
+    def test_limit_parses_attached_stop_loss_without_counting_filled_entry_size(self):
+        raw = {
+            **self.limit,
+            "side": "BUY",
+            "positionSide": "LONG",
+            "stopLoss": {"type": "STOP_MARKET", "stopPrice": 64000.25, "quantity": 0},
+        }
+
+        order = limit_orders_from_dicts([raw])[0]
+
+        self.assertEqual(order.remaining_base_amount, Decimal("0.75"))
+        self.assertEqual(order.stop_loss, Decimal("64000.25"))
+        self.assertIsNone(order.stop_loss_quantity)
+        self.assertFalse(order.reduce_only)
+        self.assertIs(order.raw, raw)
+
+    def test_limit_parses_json_attachment_and_retains_explicit_stop_quantity(self):
+        attachment = {"type": "STOP", "stopPrice": "64000.25", "price": "63900", "quantity": "0.25"}
+        order = limit_orders_from_dicts([{**self.limit, "stopLoss": json.dumps(attachment)}])[0]
+
+        self.assertEqual(order.stop_loss, Decimal("64000.25"))
+        self.assertEqual(order.stop_loss_quantity, Decimal("0.25"))
+        self.assertEqual(order.remaining_base_amount, Decimal("0.75"))
+
+    def test_limit_attachment_without_quantity_follows_full_entry_size(self):
+        order = limit_orders_from_dicts([
+            {**self.limit, "stopLoss": {"type": "STOP_MARKET", "stopPrice": "66000"}}
+        ])[0]
+
+        self.assertEqual(order.stop_loss, Decimal("66000"))
+        self.assertIsNone(order.stop_loss_quantity)
+
+    def test_limit_ignores_empty_invalid_and_take_profit_attachments(self):
+        attachments = [
+            None, "", "not json", "[]", "null", [], {},
+            {"type": "", "quantity": 0, "stopPrice": 0, "price": 0, "workingType": ""},
+            {"type": "TAKE_PROFIT_MARKET", "stopPrice": "64000"},
+            {"stopPrice": "64000"},
+        ]
+        attachments.extend(
+            {"type": "STOP_MARKET", "stopPrice": value}
+            for value in (None, "", "bad", "NaN", "Infinity", "-Infinity", "0", "-1", {})
+        )
+        attachments.extend(
+            {"type": "STOP_MARKET", "stopPrice": "64000", "quantity": value}
+            for value in (None, "", "bad", "NaN", "Infinity", "-Infinity", "-1", {})
+        )
+        for attachment in attachments:
+            with self.subTest(attachment=attachment):
+                order = limit_orders_from_dicts([{**self.limit, "stopLoss": attachment}])[0]
+                self.assertIsNone(order.stop_loss)
+                self.assertIsNone(order.stop_loss_quantity)
+
     def test_stop_market_and_stop_limit_map_to_existing_stop_types(self):
         market, limit = stop_orders_from_dicts([self.stop, {**self.stop, "type": "STOP"}])
         self.assertEqual((market.order_type, limit.order_type), ("stop-loss", "stop-loss-limit"))
