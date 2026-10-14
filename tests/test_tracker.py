@@ -14,6 +14,7 @@ from active_trades.models import AccountInfo, AccountSnapshot, ActiveTrade, Limi
 from active_trades.risk import find_protective_stop
 from active_trades.settings import Settings
 from active_trades.tracker import ActiveTradesTracker
+from active_trades.ui import render_plain
 
 
 @dataclass
@@ -201,6 +202,7 @@ class TestTracker(TestCase):
             snapshot = tracker.collect_snapshot()
 
             self.assertEqual(len(snapshot.accounts), 1)
+            self.assertTrue(snapshot.accounts_complete)
             trade = snapshot.accounts[0].trades[0]
             self.assertEqual(trade.position.symbol, "BTC")
             self.assertEqual(trade.risk_usd, Decimal("200.0"))
@@ -275,6 +277,7 @@ class TestTracker(TestCase):
                 self.assertEqual(section.trades[0].risk_state, expected_state)
                 self.assertIsNone(section.trades[0].risk_usd)
                 self.assertTrue(section.errors)
+                self.assertTrue(snapshot.accounts_complete)
 
     def test_disabled_order_reads_skip_authentication_and_market_metadata(self):
         with TemporaryDirectory() as tmp:
@@ -391,11 +394,13 @@ class TestBingxTracker(TestCase):
             bingx.fetch_positions.side_effect = BingxApiError("temporarily unavailable")
             failed = tracker.collect_snapshot()
             self.assertEqual(failed.accounts[1].positions_state, "unavailable")
+            self.assertTrue(failed.accounts_complete)
             self.assertEqual(json.loads(state_path.read_text())["positions"], saved)
 
             bingx.fetch_positions.side_effect = None
             bingx.fetch_positions.return_value = [bingx_position(created=False)]
             recovered = tracker.collect_snapshot()
+            self.assertTrue(recovered.accounts_complete)
             self.assertEqual(recovered.accounts[1].trades[0].opened_at, REST_TIME)
             self.assertEqual(recovered.accounts[1].trades[0].opened_at_source, "state")
 
@@ -437,6 +442,7 @@ class TestBingxTracker(TestCase):
                 self.assertEqual(section.trades[0].risk_state, expected_state)
                 self.assertIsNone(section.trades[0].risk_usd)
                 self.assertEqual(section.limit_orders, ())
+                self.assertTrue(snapshot.accounts_complete)
 
     def test_lighter_discovery_failure_still_collects_bingx(self):
         with TemporaryDirectory() as tmp:
@@ -452,6 +458,36 @@ class TestBingxTracker(TestCase):
             self.assertEqual(len(snapshot.accounts[0].trades), 1)
             self.assertEqual(len(snapshot.accounts[0].limit_orders), 1)
             self.assertIn("Lighter account discovery failed", snapshot.errors[0])
+            self.assertFalse(snapshot.accounts_complete)
+
+    def test_lighter_discovery_warning_marks_positions_incomplete(self):
+        with TemporaryDirectory() as tmp:
+            client = FakeClient()
+            raw_account = client.fetch_account_by_index(1)
+            raw_account.pop("l1_address")
+            with patch.object(client, "fetch_account_by_index", return_value=raw_account):
+                snapshot = ActiveTradesTracker(
+                    make_settings(Path(tmp) / "state.json", explicit_account_indexes=()),
+                    client=client, auth_provider=FakeAuthProvider(),
+                ).collect_snapshot()
+
+            self.assertEqual(len(snapshot.accounts[0].trades), 1)
+            self.assertEqual(snapshot.accounts[0].positions_state, "available")
+            self.assertIn("using base account only", snapshot.errors[0])
+            self.assertFalse(snapshot.accounts_complete)
+
+    def test_lighter_position_failure_preserves_account_discovery_coverage(self):
+        with TemporaryDirectory() as tmp:
+            client = FakeClient()
+            with patch.object(client, "fetch_account_by_index", side_effect=LighterApiError("positions offline")):
+                snapshot = ActiveTradesTracker(
+                    make_settings(Path(tmp) / "state.json"),
+                    client=client, auth_provider=FakeAuthProvider(),
+                ).collect_snapshot()
+
+            self.assertEqual(snapshot.accounts[0].positions_state, "unavailable")
+            self.assertEqual(snapshot.errors, ())
+            self.assertTrue(snapshot.accounts_complete)
 
     def test_disabled_orders_apply_to_both_exchanges(self):
         with TemporaryDirectory() as tmp:
@@ -479,6 +515,7 @@ class TestBingxTracker(TestCase):
             section = snapshot.accounts[1]
             self.assertEqual(section.account.exchange, "bingx")
             self.assertEqual(section.positions_state, "auth-needed")
+            self.assertTrue(snapshot.accounts_complete)
             self.assertEqual(section.orders_state, "auth-needed")
             self.assertEqual(section.trades, ())
             self.assertEqual(section.limit_orders, ())
@@ -563,6 +600,23 @@ class TestLivePositionsMerge(TestCase):
         result = self.tracker.apply_live_positions(make_snapshot(), {1: self.update([])})
         self.assertEqual(result.accounts[0].trades, ())
         self.assertEqual(len(result.accounts[0].limit_orders), 1)
+
+    def test_live_recovery_clears_partial_total_after_failed_position_read(self):
+        snapshot = make_snapshot(accounts=(1, 2))
+        snapshot = replace(snapshot, accounts=(
+            replace(snapshot.accounts[0], trades=(), positions_state="unavailable"),
+            snapshot.accounts[1],
+        ))
+        self.assertTrue(snapshot.accounts_complete)
+        self.assertIn("Partial", render_plain(snapshot, refresh_seconds=15))
+
+        recovered = self.tracker.apply_live_positions(snapshot, {1: self.update([make_position(pnl="15")])})
+
+        self.assertTrue(recovered.accounts_complete)
+        self.assertEqual(recovered.accounts[0].positions_state, "available")
+        output = render_plain(recovered, refresh_seconds=15)
+        self.assertIn("+$25.00", output)
+        self.assertNotIn("Partial", output)
 
     def test_live_merge_performs_no_rest_history_auth_or_state_operations(self):
         self.tracker.apply_live_positions(make_snapshot(), {1: self.update([make_position(pnl="15")])})

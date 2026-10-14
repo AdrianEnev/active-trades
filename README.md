@@ -99,7 +99,9 @@ Protocol details: [Lighter WebSocket reference](https://apidocs.lighter.xyz/docs
 
 ## Display
 
-The dashboard always has two shared sections: positions and limit orders. Rows from every discovered Lighter account and the BingX account appear together, with a dim source label beneath the asset. Empty or unavailable reads remain labeled by source inside the shared sections. Narrow terminals use a compact layout so risk and UPNL amounts remain readable.
+The top `ACTIVE TRADES` panel groups general data: status, position and account counts, update times, refresh cadences, and `TOTAL UPNL`. The total sums unrealized PNL across all open positions from every tracked Lighter account and BingX, updating with the position values. Gains are green and losses are red. If position data is missing, the available subtotal is labeled partial; if no values are available, it shows `n/a`. No open positions shows `$0.00`. This general section stays visible while paging.
+
+The dashboard also has two shared sections: positions and limit orders. Rows from every discovered Lighter account and the BingX account appear together, with a dim source label beneath the asset. Empty or unavailable reads remain labeled by source inside the shared sections. Narrow terminals use a compact layout so risk and UPNL amounts remain readable.
 
 When an interactive terminal is too short to fit the dashboard, use the arrow keys or `n`/`p` to move through pages (`Tab` also advances). `q` or `Ctrl+C` exits. `--once` prints every account without paging.
 

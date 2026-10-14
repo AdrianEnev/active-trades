@@ -211,6 +211,7 @@ class ActiveTradesTracker:
             accounts=tuple(account_sections),
             errors=tuple(global_errors),
             pnl_collected_at=collected_at,
+            accounts_complete=not global_errors,
         )
 
     def _collect_bingx(self, collected_at: datetime) -> AccountSnapshot:

@@ -125,6 +125,7 @@ class TrackerSnapshot:
     accounts: tuple[AccountSnapshot, ...]
     errors: tuple[str, ...] = ()
     pnl_collected_at: datetime | None = None
+    accounts_complete: bool = True
 
 
 def now_utc() -> datetime:

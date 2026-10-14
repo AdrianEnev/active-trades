@@ -296,6 +296,120 @@ def _mixed_snapshot() -> TrackerSnapshot:
     )
 
 
+def _with_pnl_values(snapshot: TrackerSnapshot, *values: str | None) -> TrackerSnapshot:
+    pnls = iter(values)
+    accounts = []
+    for account in snapshot.accounts:
+        trades = []
+        for trade in account.trades:
+            value = next(pnls)
+            trades.append(replace(trade, position=replace(
+                trade.position, unrealized_pnl=Decimal(value) if value is not None else None,
+            )))
+        accounts.append(replace(account, trades=tuple(trades)))
+    return replace(snapshot, accounts=tuple(accounts))
+
+
+@pytest.mark.parametrize("width", [28, 45, 100])
+@pytest.mark.parametrize(
+    ("values", "expected", "color"),
+    [
+        (("123.45", "-2.50", "12.34", "6.75"), "+$140.04", "green"),
+        (("123.45", "-2.50", "-147.70", "6.75"), "-$20.00", "red"),
+        (("123.45", "-2.50", "-127.70", "6.75"), "+$0.00", "green"),
+        (("0.004", "0.004", "0.004", "0.004"), "+$0.02", "green"),
+    ],
+)
+def test_total_upnl_sums_all_accounts_and_exchanges_before_rounding(
+    width: int, values: tuple[str, ...], expected: str, color: str,
+) -> None:
+    snapshot = _with_pnl_values(_mixed_snapshot(), *values)
+    plain = render_plain(snapshot, refresh_seconds=15, width=width)
+    output = StringIO()
+    console = Console(file=output, width=width, color_system=None)
+    console.print(render_snapshot(snapshot, refresh_seconds=15))
+
+    for rendered in (plain, output.getvalue()):
+        top = rendered.partition("POSITIONS ·")[0]
+        assert top.count("TOTAL UPNL") == 1
+        assert expected in top
+        assert "Partial" not in top
+        assert max(map(len, rendered.splitlines())) <= width
+    # General data, including the total, shares a single top panel.
+    top = output.getvalue().partition("╭─ POSITIONS")[0]
+    assert top.count("╭") == 1
+    assert "TOTAL UPNL" in top.partition("╰")[0]
+    segments = list(console.render(render_snapshot(snapshot, refresh_seconds=15)))
+    assert any(
+        segment.text.strip() == expected and segment.style.bold and segment.style.color.name == color
+        for segment in segments
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "expected", "note"),
+    [
+        ("missing-pnl", "+$127.70", "Partial · missing data"),
+        ("unavailable-account", "+$120.95", "Partial · missing data"),
+        ("incomplete-discovery", "+$140.04", "Partial · missing data"),
+        ("unknown-pnl", "n/a", "UPNL unavailable"),
+        ("discovery-failed", "n/a", "UPNL unavailable"),
+        ("no-positions", "+$0.00", None),
+        ("orders-unavailable", "+$140.04", None),
+        ("stream-disconnected", "+$140.04", None),
+    ],
+)
+def test_total_upnl_distinguishes_partial_unknown_and_empty_data(
+    case: str, expected: str, note: str | None,
+) -> None:
+    snapshot = _with_pnl_values(_mixed_snapshot(), "123.45", "-2.50", "12.34", "6.75")
+    if case == "missing-pnl":
+        snapshot = _mixed_snapshot()
+    elif case == "unavailable-account":
+        snapshot = replace(snapshot, accounts=(
+            snapshot.accounts[0],
+            replace(snapshot.accounts[1], trades=(), positions_state="unavailable"),
+        ))
+    elif case == "incomplete-discovery":
+        snapshot = replace(snapshot, accounts_complete=False)
+    elif case == "unknown-pnl":
+        snapshot = _with_pnl_values(snapshot, None, None, None, None)
+    elif case == "discovery-failed":
+        snapshot = replace(snapshot, accounts=(), errors=("Lighter account discovery failed.",))
+    elif case == "no-positions":
+        snapshot = replace(snapshot, accounts=tuple(replace(account, trades=()) for account in snapshot.accounts))
+    elif case == "orders-unavailable":
+        snapshot = replace(snapshot, accounts=tuple(
+            replace(account, orders_state="unavailable", errors=("Could not fetch active orders.",))
+            for account in snapshot.accounts
+        ))
+    elif case == "stream-disconnected":
+        snapshot = replace(snapshot, errors=("UPNL stream disconnected; retrying.",))
+    plain = render_plain(snapshot, refresh_seconds=15, width=28)
+    output = StringIO()
+    Console(file=output, width=28, color_system=None).print(render_snapshot(snapshot, refresh_seconds=15))
+
+    for rendered in (plain, output.getvalue()):
+        top = rendered.partition("TOTAL UPNL")[2].partition("POSITIONS ·")[0]
+        assert expected in top
+        if note:
+            assert note in top
+        else:
+            assert "Partial" not in top
+            assert "UPNL unavailable" not in top
+
+
+def test_total_upnl_tracks_updated_and_closed_positions_on_rerender() -> None:
+    snapshot = _with_pnl_values(_mixed_snapshot(), "123.45", "-2.50", "12.34", "6.75")
+    updated = _with_pnl_values(snapshot, "120.00", "-1.00", "10.00", "6.75")
+    closed = replace(updated, accounts=tuple(replace(account, trades=()) for account in updated.accounts))
+
+    for current, expected in ((snapshot, "+$140.04"), (updated, "+$135.75"), (closed, "+$0.00")):
+        output = StringIO()
+        Console(file=output, width=45, color_system=None).print(render_snapshot(current, refresh_seconds=15))
+        assert expected in output.getvalue().partition("POSITIONS ·")[0]
+
+
 @pytest.mark.parametrize("width", [28, 32, 45, 100])
 def test_both_exchanges_share_exactly_two_tables_with_source_on_every_row(width: int) -> None:
     snapshot = _mixed_snapshot()
@@ -411,33 +525,45 @@ def _render_dashboard_page(snapshot: TrackerSnapshot, page: int | None, *, heigh
 def test_live_pager_keeps_header_and_navigation_fixed_at_45_by_24() -> None:
     snapshot = _paged_snapshot()
     first = _render_dashboard_page(snapshot, 0)
-    second = _render_dashboard_page(snapshot, 1)
+    page_match = re.search(r"Page 1/(\d+)", first.splitlines()[-1])
+    assert page_match is not None
+    page_count = int(page_match[1])
+    pages = [_render_dashboard_page(snapshot, page) for page in range(page_count)]
 
     assert len(_render_dashboard_page(snapshot, None).splitlines()) > 24
-    for rendered in (first, second):
+    assert page_count > 1
+    for page, rendered in enumerate(pages, start=1):
         assert len(rendered.splitlines()) == 24
         assert max(map(len, rendered.splitlines())) <= 45
         assert "ACTIVE TRADES" in rendered.splitlines()[0]
         assert "Data 15s · UPNL 0.5s" in rendered
+        assert "TOTAL UPNL" in rendered
+        assert "+$120.95" in rendered
+        assert f"Page {page}/{page_count}" in rendered
         assert "←/→ n/p · q quit" in rendered.splitlines()[-1]
-    assert "Page 1/2" in first
-    assert "Page 2/2" in second
     assert "$11.21" in first
     assert "+$123.45" in first
-    assert "Lighter · Sub 1" in second
+    assert "Lighter · Sub 1" in "\n".join(pages[1:])
 
 
 def test_live_pager_exposes_every_body_row_and_wraps_forward_and_backward() -> None:
     snapshot = _paged_snapshot()
     complete = _render_dashboard_page(snapshot, None).splitlines()
     first = _render_dashboard_page(snapshot, 0).splitlines()
-    second = _render_dashboard_page(snapshot, 1).splitlines()
+    header_height = next(number for number, line in enumerate(complete) if line.startswith("╭─ POSITIONS"))
+    page_match = re.search(r"Page 1/(\d+)", first[-1])
+    assert page_match is not None
+    page_count = int(page_match[1])
 
-    # Five header rows stay fixed; body rows appear once across both pages.
-    reconstructed = first[5:-1] + second[5:-1]
-    assert reconstructed[: len(complete) - 5] == complete[5:]
-    assert _render_dashboard_page(snapshot, 2) == _render_dashboard_page(snapshot, 0)
-    assert _render_dashboard_page(snapshot, -1) == _render_dashboard_page(snapshot, 1)
+    # The general section stays fixed; body rows appear once across all pages.
+    reconstructed = [
+        line
+        for page in range(page_count)
+        for line in _render_dashboard_page(snapshot, page).splitlines()[header_height:-1]
+    ]
+    assert reconstructed[: len(complete) - header_height] == complete[header_height:]
+    assert _render_dashboard_page(snapshot, page_count) == _render_dashboard_page(snapshot, 0)
+    assert _render_dashboard_page(snapshot, -1) == _render_dashboard_page(snapshot, page_count - 1)
 
 
 def test_live_pager_respects_shorter_terminal_height() -> None:
@@ -451,7 +577,7 @@ def test_mixed_exchange_pager_preserves_every_row_and_both_refresh_cadences() ->
     snapshot = _mixed_snapshot()
     complete = _render_dashboard_page(snapshot, None).splitlines()
     first = _render_dashboard_page(snapshot, 0).splitlines()
-    header_height = next(number + 1 for number, line in enumerate(complete) if line.startswith("╰"))
+    header_height = next(number for number, line in enumerate(complete) if line.startswith("╭─ POSITIONS"))
     page_match = re.search(r"Page 1/(\d+)", first[-1])
     assert page_match is not None
     page_count = int(page_match[1])

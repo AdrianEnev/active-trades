@@ -169,6 +169,10 @@ def render_plain(
         lines.append(f"● {status}   {total_trades} OPEN POSITIONS   {len(snapshot.accounts)} ACCOUNTS")
         lines.append(f"Updated {_fmt_datetime(snapshot.collected_at, seconds=True)}")
     lines.extend(_cadence_lines(snapshot, refresh_seconds, pnl_refresh_seconds))
+    total_pnl, incomplete = _total_pnl(snapshot)
+    lines.extend(("", f"TOTAL UPNL  {_fmt_pnl(total_pnl)}"))
+    if incomplete:
+        lines.append(_total_pnl_note(total_pnl))
     notices = _notices(snapshot)
     for notice in notices:
         lines.extend(f"! {part}" for part in wrap(notice, width=max(10, width - 2)))
@@ -232,7 +236,7 @@ def _header_panel(
     )
     cadences = [Text(line, style="dim") for line in _cadence_lines(snapshot, refresh_seconds, pnl_refresh_seconds)]
     return Panel(
-        Group(first_line, second_line, *cadences),
+        Group(first_line, second_line, *cadences, Text(""), _total_pnl_summary(snapshot)),
         title="ACTIVE TRADES",
         title_align="left",
         box=box.ROUNDED,
@@ -240,6 +244,37 @@ def _header_panel(
         padding=(0, 1),
         expand=True,
     )
+
+
+def _total_pnl(snapshot: TrackerSnapshot) -> tuple[Decimal | None, bool]:
+    total = Decimal("0")
+    valued_positions = 0
+    incomplete = not snapshot.accounts_complete or (not snapshot.accounts and bool(snapshot.errors))
+    for account in snapshot.accounts:
+        incomplete = incomplete or account.positions_state != "available"
+        for trade in account.trades:
+            pnl = trade.position.unrealized_pnl
+            if pnl is None:
+                incomplete = True
+            else:
+                total += pnl
+                valued_positions += 1
+    return (total if valued_positions or not incomplete else None), incomplete
+
+
+def _total_pnl_note(total: Decimal | None) -> str:
+    return "UPNL unavailable" if total is None else "Partial · missing data"
+
+
+def _total_pnl_summary(snapshot: TrackerSnapshot) -> Any:
+    total, incomplete = _total_pnl(snapshot)
+    contents = [Text.assemble(
+        ("TOTAL UPNL  ", "bold"),
+        (_fmt_pnl(total), f"bold {_pnl_style(total)}"),
+    )]
+    if incomplete:
+        contents.append(Text(_total_pnl_note(total), style="yellow"))
+    return Group(*contents)
 
 
 def _trades_table(trades: tuple[TradeRow, ...], *, width: int) -> Any:
@@ -473,16 +508,22 @@ def _risk_style(trade: ActiveTrade) -> str:
 
 
 def _pnl_label(trade: ActiveTrade) -> str:
-    pnl = trade.position.unrealized_pnl
+    return _fmt_pnl(trade.position.unrealized_pnl)
+
+
+def _fmt_pnl(pnl: Decimal | None) -> str:
     if pnl is None:
         return "n/a"
     return f"{'-' if pnl < 0 else '+'}{_fmt_money(abs(pnl))}"
 
 
+def _pnl_style(pnl: Decimal | None) -> str:
+    return "dim" if pnl is None else "red" if pnl < 0 else "green"
+
+
 def _pnl_text(trade: ActiveTrade) -> Any:
     pnl = trade.position.unrealized_pnl
-    style = "dim" if pnl is None else "red" if pnl < 0 else "green"
-    return Text(_pnl_label(trade), style=style)
+    return Text(_fmt_pnl(pnl), style=_pnl_style(pnl))
 
 
 def _fmt_decimal(value: Decimal) -> str:
