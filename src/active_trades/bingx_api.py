@@ -16,7 +16,7 @@ from active_trades.models import LimitOrder, Position, StopOrder
 
 
 class BingxApiError(RuntimeError):
-    """A BingX read failed with a message safe to display in the terminal."""
+    """A BingX request failed with a message safe to display in the terminal."""
 
 
 class BingxAuthUnavailable(BingxApiError):
@@ -35,6 +35,7 @@ _ERROR_MESSAGES = {
     100421: "request timestamp rejected; synchronize the system clock.",
     100500: "the service is busy; retry later.",
     109400: "request parameters were rejected.",
+    109421: "the order no longer exists; it may have filled or been cancelled.",
     109500: "the service returned an internal error; retry later.",
 }
 _ACTIVE_ORDER_STATUSES = {"", "NEW", "PENDING", "PARTIALLY_FILLED"}
@@ -45,7 +46,7 @@ _FALLBACK_BASE_URLS = {
 
 
 class BingxRestClient:
-    """Read USDT/USDC perpetual positions and orders using BingX OpenAPI."""
+    """Read USDT/USDC perpetual positions and orders, and cancel orders, using BingX OpenAPI."""
 
     def __init__(
         self,
@@ -68,7 +69,26 @@ class BingxRestClient:
         payload = self._get_json("/openApi/swap/v2/trade/openOrders")
         return _objects_from_payload(payload, "orders")
 
-    def _get_json(self, path: str) -> dict[str, Any]:
+    def fetch_order_history(self, *, start_ms: int, end_ms: int, limit: int = 100) -> list[dict[str, Any]]:
+        """Filled and cancelled orders across all symbols; triggered stops carry their trigger time."""
+        payload = self._get_json(
+            "/openApi/swap/v2/trade/allOrders",
+            {"startTime": str(start_ms), "endTime": str(end_ms), "limit": str(max(1, min(1000, limit)))},
+        )
+        return _objects_from_payload(payload, "orders")
+
+    def cancel_order(self, *, symbol: str, order_id: str) -> dict[str, Any]:
+        """Cancel one open perpetual order. The API key needs trading permission."""
+        return self._request(
+            "DELETE", "/openApi/swap/v2/trade/order", {"symbol": symbol, "orderId": order_id}, write=True
+        )
+
+    def _get_json(self, path: str, query: dict[str, str] | None = None) -> dict[str, Any]:
+        return self._request("GET", path, query)
+
+    def _request(
+        self, method: str, path: str, query: dict[str, str] | None = None, *, write: bool = False
+    ) -> dict[str, Any]:
         if not self.api_key or not self.api_secret:
             raise BingxAuthUnavailable(
                 "Add both BINGX_API_KEY and BINGX_API_SECRET to read BingX positions and limit orders."
@@ -79,20 +99,22 @@ class BingxRestClient:
         if fallback:
             base_urls.append(fallback)
         for attempt, base_url in enumerate(base_urls):
-            # These endpoints need no business parameters: omitting symbol
-            # returns all markets. Sign the sorted, unencoded string, using a
-            # fresh timestamp for each request (including the domain fallback).
-            params = {"recvWindow": "5000", "timestamp": str(int(time.time() * 1000))}
+            # Omitting symbol returns all markets. Sign the sorted, unencoded
+            # string, using a fresh timestamp for each request (including the
+            # domain fallback). Business parameters are plain numbers or
+            # symbols such as BTC-USDT, which urlencode leaves unchanged.
+            params = {**(query or {}), "recvWindow": "5000", "timestamp": str(int(time.time() * 1000))}
             canonical = "&".join(f"{key}={params[key]}" for key in sorted(params))
             signature = hmac.new(
                 self.api_secret.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256
             ).hexdigest()
-            query = urlencode({**params, "signature": signature})
-            url = f"{base_url}{path}?{query}"
+            # BingX verifies the signature against the query as sent, so keep it sorted.
+            query_string = urlencode([*sorted(params.items()), ("signature", signature)])
+            url = f"{base_url}{path}?{query_string}"
             try:
                 request = Request(
                     url,
-                    method="GET",
+                    method=method,
                     headers={
                         "Accept": "application/json",
                         "User-Agent": "active-trades/0.1",
@@ -124,7 +146,7 @@ class BingxRestClient:
 
             if not isinstance(payload, dict):
                 raise BingxApiError("BingX returned a non-object JSON response.")
-            _raise_for_bingx_code(payload)
+            _raise_for_bingx_code(payload, write=write)
             return payload
         raise BingxApiError("BingX request failed.")
 
@@ -161,6 +183,7 @@ def positions_from_dicts(
                 raw=raw,
                 exchange="bingx",
                 position_id=_identifier(raw, "positionId", "positionID"),
+                realized_pnl=_decimal(raw.get("realisedProfit")),
             )
         )
     return positions
@@ -209,11 +232,14 @@ def limit_orders_from_dicts(
 
 
 def stop_orders_from_dicts(
-    raw_orders: list[dict[str, Any]], *, account_index: int = 0
+    raw_orders: list[dict[str, Any]], *, account_index: int = 0, include_take_profit: bool = False
 ) -> list[StopOrder]:
+    types = {"STOP_MARKET": "stop-loss", "STOP": "stop-loss-limit"}
+    if include_take_profit:
+        types.update({"TAKE_PROFIT_MARKET": "take-profit", "TAKE_PROFIT": "take-profit-limit"})
     orders: list[StopOrder] = []
     for raw in raw_orders:
-        if not isinstance(raw, dict) or _text(raw, "type") not in {"STOP_MARKET", "STOP"} or not _is_active(raw):
+        if not isinstance(raw, dict) or _text(raw, "type") not in types or not _is_active(raw):
             continue
         symbol = str(raw.get("symbol") or "").strip()
         side = _text(raw, "side").lower()
@@ -237,7 +263,7 @@ def stop_orders_from_dicts(
                 remaining_base_amount=None if close_position else remaining,
                 created_at=_order_created_at(raw),
                 order_id=_identifier(raw, "orderID", "orderId"),
-                order_type="stop-loss" if _text(raw, "type") == "STOP_MARKET" else "stop-loss-limit",
+                order_type=types[_text(raw, "type")],
                 reduce_only=_is_reducing_order(raw),
                 status="in-progress" if _text(raw, "status") == "PARTIALLY_FILLED" else "open",
                 raw=raw,
@@ -247,16 +273,20 @@ def stop_orders_from_dicts(
     return orders
 
 
-def _raise_for_bingx_code(payload: dict[str, Any]) -> None:
+def _raise_for_bingx_code(payload: dict[str, Any], *, write: bool = False) -> None:
     try:
         code = int(payload["code"])
     except (KeyError, TypeError, ValueError, OverflowError):
         raise BingxApiError("BingX response omitted a valid status code.") from None
     if code == 0:
         return
+    if write and code == 100004:
+        raise BingxAuthUnavailable(
+            f"BingX error {code}: the API key cannot trade; enable perpetual futures trading for it."
+        )
     if code in _AUTH_ERROR_MESSAGES:
         raise BingxAuthUnavailable(f"BingX error {code}: {_AUTH_ERROR_MESSAGES[code]}")
-    detail = _ERROR_MESSAGES.get(code, "the account read was rejected.")
+    detail = _ERROR_MESSAGES.get(code, "the request was rejected." if write else "the account read was rejected.")
     raise BingxApiError(f"BingX error {code}: {detail}")
 
 

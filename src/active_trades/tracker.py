@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from active_trades.bingx_api import (
     BingxApiError,
@@ -38,6 +38,13 @@ from active_trades.risk import find_protective_stop, infer_opened_at_from_trades
 from active_trades.settings import Settings
 from active_trades.state import PositionStateStore
 from active_trades.pnl_stream import StreamPositions
+from active_trades.profit_tracking import PositionProfitTracker
+from active_trades.close_alerts import (
+    ClosedTrade,
+    bingx_closed_trades,
+    lighter_close_orders,
+    lighter_closed_trades,
+)
 
 
 class ActiveTradesTracker:
@@ -73,6 +80,10 @@ class ActiveTradesTracker:
                 timeout_seconds=settings.timeout_seconds,
             )
         self._market_symbols: dict[int, str] = {}
+        self._profit_tracker = PositionProfitTracker()
+        self._profit_tracking_loaded = False
+        self._profit_seeded_accounts: set[tuple[str, int]] = set()
+        self.journal = None
 
     def discover_accounts(self) -> tuple[list[AccountInfo], list[str]]:
         errors: list[str] = []
@@ -118,6 +129,9 @@ class ActiveTradesTracker:
         )
 
     def collect_snapshot(self) -> TrackerSnapshot:
+        if not self._profit_tracking_loaded:
+            self._profit_tracker.restore(self.state_store.profit_tracking())
+            self._profit_tracking_loaded = True
         collected_at = now_utc()
         account_sections: list[AccountSnapshot] = []
         active_position_keys: set[str] = set()
@@ -204,16 +218,36 @@ class ActiveTradesTracker:
             active_position_keys.update(trade.position.key for trade in bingx_section.trades)
             positions_complete = positions_complete and bingx_section.positions_state == "available"
 
+        account_sections = [
+            replace(section, trades=self._profit_tracker.observe_account(
+                section.trades,
+                exchange=section.account.exchange,
+                account_index=section.account.index,
+                observed_at=collected_at,
+            )) if section.positions_state == "available" else section
+            for section in account_sections
+        ]
+        self._profit_seeded_accounts.update(
+            (section.account.exchange, section.account.index)
+            for section in account_sections if section.positions_state == "available"
+        )
+
         if positions_complete:
             self.state_store.prune(active_position_keys)
-        self.state_store.save()
-        return TrackerSnapshot(
+        self.save_state()
+        snapshot = TrackerSnapshot(
             collected_at=collected_at,
             accounts=tuple(account_sections),
             errors=tuple(global_errors),
             pnl_collected_at=collected_at,
             accounts_complete=not global_errors,
         )
+        return self.journal.sync(snapshot) if self.journal is not None else snapshot
+
+    def save_state(self) -> None:
+        """Persist profit baselines and any highlights received through the stream."""
+        self.state_store.remember_profit_tracking(self._profit_tracker.dump())
+        self.state_store.save()
 
     def _collect_bingx(self, collected_at: datetime) -> AccountSnapshot:
         assert self.bingx_client is not None
@@ -236,7 +270,7 @@ class ActiveTradesTracker:
         if self.settings.fetch_orders:
             try:
                 raw_orders = self.bingx_client.fetch_active_orders()
-                stops = bingx_stop_orders_from_dicts(raw_orders)
+                stops = bingx_stop_orders_from_dicts(raw_orders, include_take_profit=True)
                 limits = bingx_limit_orders_from_dicts(raw_orders)
                 orders_state = "available"
             except BingxAuthUnavailable as exc:
@@ -341,6 +375,15 @@ class ActiveTradesTracker:
             ):
                 accounts.append(section)
                 continue
+            scope = (section.account.exchange, section.account.index)
+            if scope not in self._profit_seeded_accounts:
+                self._profit_tracker.observe_account(
+                    section.trades,
+                    exchange=section.account.exchange,
+                    account_index=section.account.index,
+                    observed_at=section.pnl_collected_at or snapshot.collected_at,
+                )
+                self._profit_seeded_accounts.add(scope)
             previous = {trade.position.key: trade for trade in section.trades}
             trades: list[ActiveTrade] = []
             for row_number, position in enumerate(update.positions, start=1):
@@ -375,12 +418,60 @@ class ActiveTradesTracker:
                         risk_usd=None,
                         risk_state=(section.orders_state if section.orders_state != "available" else "unavailable"),
                     ))
+            highlighted = self._profit_tracker.observe_account(
+                tuple(trades),
+                exchange=section.account.exchange,
+                account_index=section.account.index,
+                observed_at=getattr(update, "positions_received_at", update.received_at),
+            )
             accounts.append(replace(
-                section, trades=tuple(trades), pnl_collected_at=update.received_at,
+                section, trades=highlighted, pnl_collected_at=update.received_at,
                 positions_state="available",
             ))
             latest_at = max(latest_at, update.received_at)
         return replace(snapshot, accounts=tuple(accounts), pnl_collected_at=latest_at)
+
+    def fetch_closed_trades(
+        self,
+        accounts: Iterable[AccountInfo],
+        since: datetime,
+    ) -> tuple[list[ClosedTrade], list[str]]:
+        """Read SL/TP orders that filled at or after `since`, with their realized PNL."""
+        closes: list[ClosedTrade] = []
+        errors: list[str] = []
+        for account in accounts:
+            if account.exchange == "lighter":
+                try:
+                    auth_token = self.auth_provider.token_for(account.index)
+                    close_orders = lighter_close_orders(
+                        self.client.fetch_inactive_orders(account.index, auth_token), since=since
+                    )
+                    if not close_orders:
+                        continue
+                    raw_trades = self.client.fetch_trades(
+                        account_index=account.index, market_id=None, authorization=auth_token, limit=100
+                    )
+                except AuthUnavailable:
+                    continue  # The dashboard already reports accounts that need credentials.
+                except LighterApiError as exc:
+                    errors.append(f"Lighter {account.label}: {exc}")
+                    continue
+                closes.extend(lighter_closed_trades(close_orders, raw_trades, account=account))
+            elif account.exchange == "bingx" and self.bingx_client is not None:
+                end = now_utc()
+                # BingX limits history ranges; alerts already sent are deduplicated.
+                start = max(since, end - timedelta(hours=24))
+                try:
+                    raw_orders = self.bingx_client.fetch_order_history(
+                        start_ms=int(start.timestamp() * 1000),
+                        end_ms=int(end.timestamp() * 1000),
+                        limit=500,
+                    )
+                except (BingxAuthUnavailable, BingxApiError) as exc:
+                    errors.append(f"BingX: {exc}")
+                    continue
+                closes.extend(bingx_closed_trades(raw_orders, since=since))
+        return closes, errors
 
     def _resolve_opened_at(
         self,

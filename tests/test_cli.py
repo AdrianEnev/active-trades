@@ -119,3 +119,59 @@ def test_completed_mixed_exchange_refresh_only_updates_lighter_stream_subscripti
     assert rendered[-1] == refreshed
     stream.set_accounts.assert_called_once_with((1,))
     stream.seed_positions.assert_called_once_with(1, (), refreshed.collected_at)
+
+
+def test_finished_cancel_triggers_an_immediate_refresh_and_shows_its_result():
+    tracker = Mock()
+    tracker.apply_live_positions.side_effect = lambda current, updates: current
+    stream = Mock(notice=None)
+    stream.latest_positions.return_value = {}
+    executor = Mock()
+    executor.submit.return_value = Future()
+    cancels = Mock(notice="Cancelled ETH BUY limit (Lighter · Main) and 2 SL/TP.")
+    cancels.tick.side_effect = [False, True, False]
+    rendered = []
+    settings = SimpleNamespace(refresh_seconds=60, pnl_refresh_seconds=0.5)
+    with patch("active_trades.cli._sleep"), patch("active_trades.cli.time.monotonic", return_value=0.0):
+        _live_loop(
+            tracker, _snapshot(), settings, stream, executor, rendered.append,
+            lambda: len(rendered) == 3, cancels=cancels,
+        )
+    executor.submit.assert_called_once_with(tracker.collect_snapshot)
+    assert rendered[1].errors == ("Cancelled ETH BUY limit (Lighter · Main) and 2 SL/TP.",)
+
+
+def test_cancel_finishing_during_a_refresh_queues_another_refresh():
+    tracker = Mock()
+    tracker.apply_live_positions.side_effect = lambda current, updates: current
+    stream = Mock(notice=None)
+    stream.latest_positions.return_value = {}
+    pending = Future()
+    executor = Mock()
+    executor.submit.side_effect = [pending, Future()]
+    cancels = Mock(notice=None)
+    elapsed = [0.0]
+    rendered = []
+    settings = SimpleNamespace(refresh_seconds=1, pnl_refresh_seconds=0.5)
+
+    def tick(_snapshot):
+        if len(rendered) == 2:
+            return True  # The cancel finishes while the first refresh is still running.
+        if len(rendered) == 3:
+            pending.set_result(_snapshot)
+        return False
+
+    cancels.tick.side_effect = tick
+
+    def sleep(seconds, should_stop):
+        elapsed[0] += seconds
+
+    with patch("active_trades.cli._sleep", side_effect=sleep), patch(
+        "active_trades.cli.time.monotonic", side_effect=lambda: elapsed[0]
+    ):
+        _live_loop(
+            tracker, _snapshot(), settings, stream, executor, rendered.append,
+            lambda: len(rendered) == 5, cancels=cancels,
+        )
+    # The second refresh starts as soon as the stale one lands, not a full interval later.
+    assert executor.submit.call_count == 2

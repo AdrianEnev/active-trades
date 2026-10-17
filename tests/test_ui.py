@@ -6,6 +6,7 @@ import re
 
 import pytest
 from rich.console import Console
+from rich.segment import Segment
 
 from active_trades.models import (
     AccountInfo,
@@ -13,6 +14,7 @@ from active_trades.models import (
     ActiveTrade,
     LimitOrder,
     Position,
+    StopOrder,
     TrackerSnapshot,
 )
 from active_trades.ui import render_plain, render_snapshot
@@ -173,6 +175,52 @@ def test_rich_upnl_colors_match_the_sign_and_missing_value_is_dim() -> None:
     assert any(segment.text.strip() == "n/a" and segment.style.dim for segment in segments)
 
 
+@pytest.mark.parametrize("width", [28, 45, 100])
+@pytest.mark.parametrize(
+    ("target_reached", "risk", "highlighted", "risk_label", "risk_color"),
+    [
+        (True, "11.21", True, "$11.21", "white"),
+        (False, "0", True, "$0.00", "cyan"),
+        (False, "11.21", False, "$11.21", "white"),
+        (False, "0.004", False, "$0.00", "white"),
+        (False, None, False, "No SL", "yellow"),
+    ],
+)
+def test_position_symbols_highlight_partial_profit_or_exact_zero_risk_in_every_layout(
+    width: int,
+    target_reached: bool,
+    risk: str | None,
+    highlighted: bool,
+    risk_label: str,
+    risk_color: str,
+) -> None:
+    snapshot = _snapshot()
+    account = snapshot.accounts[0]
+    trade = replace(
+        account.trades[0],
+        profit_target_reached=target_reached,
+        risk_usd=Decimal(risk) if risk is not None else None,
+        risk_state="missing" if risk is None else "at-risk",
+    )
+    snapshot = replace(snapshot, accounts=(replace(account, trades=(trade,)),))
+    console = Console(width=width)
+    segments = list(console.render(render_snapshot(snapshot, refresh_seconds=15)))
+
+    def color(segment: Segment) -> str | None:
+        style = segment.style
+        return style.color.name if style and style.color else None
+
+    assert any(segment.text.strip() == "BTC" and color(segment) == "cyan" for segment in segments) == highlighted
+    assert any(segment.text.strip() == risk_label and color(segment) == risk_color for segment in segments)
+    assert any(segment.text.strip() == "SHORT" and color(segment) == "red" for segment in segments)
+    assert any(segment.text.strip() == "+$123.45" and color(segment) == "green" for segment in segments)
+    assert any(
+        segment.text.strip() == "Lighter · Main" and segment.style.dim and color(segment) != "cyan"
+        for segment in segments
+    )
+    assert "\x1b" not in render_plain(snapshot, refresh_seconds=15, width=width)
+
+
 def _order_snapshot(*, price: str = "98765.4321", size: str = "0.0012") -> TrackerSnapshot:
     return TrackerSnapshot(
         collected_at=datetime(2026, 10, 12, 17, 57, 3, tzinfo=UTC),
@@ -194,6 +242,132 @@ def _order_snapshot(*, price: str = "98765.4321", size: str = "0.0012") -> Track
             ),
         ),
     )
+
+
+def _limit_risk_rows_snapshot() -> TrackerSnapshot:
+    snapshot = _order_snapshot()
+    accounts = []
+    for index, name, exchange, side, quantity, stop_price in (
+        (101, "Main", "lighter", "buy", "0.5", "90"),
+        (102, "Sub 1", "lighter", "buy", "0.5", "80"),
+        (101, "Main", "bingx", "sell", "2", "107"),
+    ):
+        order = replace(
+            snapshot.accounts[0].limit_orders[0],
+            account_index=index,
+            exchange=exchange,
+            side=side,
+            price=Decimal("100"),
+            remaining_base_amount=Decimal(quantity),
+            reduce_only=False,
+            order_id="11",
+        )
+        stop = StopOrder(
+            index,
+            order.market_id,
+            "sell" if side == "buy" else "buy",
+            Decimal(stop_price),
+            remaining_base_amount=Decimal("0") if exchange == "lighter" else Decimal(quantity),
+            reduce_only=True,
+            status="pending",
+            order_type="stop-loss",
+            raw={"parent_order_id": "11"},
+            exchange=exchange,
+        )
+        accounts.append(AccountSnapshot(
+            AccountInfo(index=index, display_name=name, exchange=exchange),
+            trades=(),
+            limit_orders=(order,),
+            stop_orders=(stop,),
+        ))
+    return replace(snapshot, accounts=tuple(accounts))
+
+
+@pytest.mark.parametrize("width", [32, 45, 60, 72, 100, 140])
+def test_limit_order_rows_show_their_own_account_risk_in_every_layout(width: int) -> None:
+    # Repeated market and parent IDs require the owning account's stop context.
+    snapshot = _limit_risk_rows_snapshot()
+    output = StringIO()
+    console = Console(file=output, width=width, color_system=None)
+    console.print(render_snapshot(snapshot, refresh_seconds=15))
+    expected_rows = (("Lighter · Main", "$5.00"), ("Lighter · Sub 1", "$10.00"), ("BingX", "$14.00"))
+
+    for rendered in (render_plain(snapshot, refresh_seconds=15, width=width), output.getvalue()):
+        orders = rendered.partition("LIMIT ORDERS · 3 OPEN")[2]
+        rows = re.split(r"(?m)^[ │]*\d+\s+BTC\s+(?:BUY|SELL)\b", orders)[1:]
+        assert len(rows) == len(expected_rows)
+        for row, (source, risk) in zip(rows, expected_rows, strict=True):
+            assert source in row
+            assert risk in row
+            assert all(other_risk not in row for _source, other_risk in expected_rows if other_risk != risk)
+        assert "Risk" in orders or "RISK" in orders
+        assert max(map(len, rendered.splitlines())) <= width
+        assert "…" not in rendered
+
+    rich_orders = output.getvalue().partition("LIMIT ORDERS · 3 OPEN")[2]
+    if width == 60:
+        assert "ASSET / SIDE" in rich_orders
+        assert "RISK" in rich_orders
+    elif width >= 72:
+        assert "RISK" in rich_orders
+        assert "REDUCE" in rich_orders
+    else:
+        assert "Risk $5.00" in rich_orders
+
+
+@pytest.mark.parametrize("width", [32, 140])
+@pytest.mark.parametrize(
+    ("case", "expected", "color"),
+    [("missing-stop", "n/a", "yellow"), ("insufficient-stop", "n/a", "yellow"),
+     ("breakeven", "$0.00", "green"), ("reducing", "$0.00", "green")],
+)
+def test_limit_order_risk_distinguishes_unknown_and_confirmed_zero_in_rows(
+    width: int, case: str, expected: str, color: str,
+) -> None:
+    snapshot = _order_snapshot(price="100", size="0.5")
+    order = replace(snapshot.accounts[0].limit_orders[0], reduce_only=False, stop_loss=Decimal("90"))
+    if case == "missing-stop":
+        order = replace(order, stop_loss=None)
+    elif case == "insufficient-stop":
+        order = replace(order, stop_loss_quantity=Decimal("0.25"))
+    elif case == "breakeven":
+        order = replace(order, stop_loss=order.price)
+    elif case == "reducing":
+        order = replace(order, reduce_only=True)
+    snapshot = replace(snapshot, accounts=(replace(snapshot.accounts[0], limit_orders=(order,)),))
+    output = StringIO()
+    console = Console(file=output, width=width, color_system=None)
+    console.print(render_snapshot(snapshot, refresh_seconds=15))
+
+    for rendered in (render_plain(snapshot, refresh_seconds=15, width=width), output.getvalue()):
+        orders = rendered.partition("LIMIT ORDERS · 1 OPEN")[2]
+        assert expected in orders
+        assert "Risk" in orders or "RISK" in orders
+        if expected == "n/a":
+            assert "$0.00" not in orders
+    segments = list(console.render(render_snapshot(snapshot, refresh_seconds=15)))
+    order_start = next(index for index, segment in enumerate(segments) if "LIMIT ORDERS ·" in segment.text)
+    assert any(
+        segment.text.strip() == expected and segment.style.color.name == color
+        for segment in segments[order_start:]
+    )
+
+
+@pytest.mark.parametrize("width", [32, 45, 60, 72, 100, 140])
+def test_large_limit_risk_survives_layout_selection_without_truncation(width: int) -> None:
+    snapshot = _order_snapshot(price="1234567891.12", size="1")
+    order = replace(snapshot.accounts[0].limit_orders[0], reduce_only=False, stop_loss=Decimal("1"))
+    snapshot = replace(snapshot, accounts=(replace(snapshot.accounts[0], limit_orders=(order,)),))
+    output = StringIO()
+    Console(file=output, width=width, color_system=None).print(render_snapshot(snapshot, refresh_seconds=15))
+
+    for rendered in (render_plain(snapshot, refresh_seconds=15, width=width), output.getvalue()):
+        orders = rendered.partition("LIMIT ORDERS · 1 OPEN")[2]
+        assert "$1,234,567,890.12" in orders
+        assert "$1,234,567,891.12" in orders
+        assert "Risk" in orders or "RISK" in orders
+        assert max(map(len, rendered.splitlines())) <= width
+        assert "…" not in rendered
 
 
 @pytest.mark.parametrize("width", [32, 45, 100])
@@ -435,6 +609,70 @@ def _risk_snapshot() -> TrackerSnapshot:
     return replace(snapshot, accounts=tuple(accounts))
 
 
+def _five_positions_with_zero_size_zk_stop(*, undersized: bool) -> TrackerSnapshot:
+    snapshot = _snapshot()
+    trades = []
+    stops = []
+    for market, risk in enumerate(("20", "10.0003", "6.665", "4"), start=1):
+        trade = _trade(101, market, f"ASSET{market}", "long", snapshot.collected_at, risk)
+        trade = replace(
+            trade,
+            position=replace(trade.position, market_id=market),
+            stop_loss=trade.position.avg_entry_price - Decimal(risk),
+        )
+        trades.append(trade)
+        stops.append(StopOrder(
+            101, market, "sell", trade.stop_loss,
+            remaining_base_amount=Decimal("1"), reduce_only=True, status="open", order_type="stop-loss",
+        ))
+    zk = _trade(101, 5, "ZK", "short", snapshot.collected_at, "8.000541")
+    zk = replace(
+        zk,
+        position=replace(zk.position, market_id=5, size=Decimal("6159"), avg_entry_price=Decimal("0.03")),
+        stop_loss=Decimal("0.031299"),
+    )
+    trades.append(zk)
+    stops.append(StopOrder(
+        101, 5, "buy", zk.stop_loss,
+        remaining_base_amount=Decimal("6000" if undersized else "0"),
+        reduce_only=True, status="pending", order_type="stop-loss",
+        raw={
+            "initial_base_amount": "6000" if undersized else "0",
+            "filled_base_amount": "0", "base_size": 6000 if undersized else 0,
+            "trigger_status": "mark-price", "parent_order_id": "0", "parent_order_index": 0,
+        },
+    ))
+    account = replace(snapshot.accounts[0], trades=tuple(trades), stop_orders=tuple(stops))
+    return replace(snapshot, accounts=(account,))
+
+
+@pytest.mark.parametrize("width", [28, 45, 100])
+@pytest.mark.parametrize("undersized", [False, True])
+def test_position_risk_header_counts_lighter_zero_size_close_all_but_warns_for_undersized_stop(
+    width: int, undersized: bool,
+) -> None:
+    snapshot = _five_positions_with_zero_size_zk_stop(undersized=undersized)
+    output = StringIO()
+    console = Console(file=output, width=width, color_system=None)
+    console.print(render_snapshot(snapshot, refresh_seconds=15))
+    expected = "≥$40.67" if undersized else "$48.67"
+    for rendered in (render_plain(snapshot, refresh_seconds=15, width=width), output.getvalue()):
+        header = _content_text(rendered.partition("POSITIONS ·")[0])
+        assert f"POSITION RISK {expected}" in header
+        assert ("Risk incomplete: SL/data" in header) is undersized
+        if not undersized:
+            assert "≥" not in header
+        assert "POSITIONS · 5 OPEN" in rendered
+        assert "$8.00" in rendered
+        assert max(map(len, rendered.splitlines())) <= width
+    segments = list(console.render(render_snapshot(snapshot, refresh_seconds=15)))
+    assert any(
+        segment.text.strip() == expected and segment.style.bold
+        and segment.style.color.name == ("yellow" if undersized else "white")
+        for segment in segments
+    )
+
+
 @pytest.mark.parametrize("width", [28, 45, 100])
 def test_general_header_shows_position_and_additional_limit_risk_across_sources(width: int) -> None:
     snapshot = _risk_snapshot()
@@ -447,7 +685,7 @@ def test_general_header_shows_position_and_additional_limit_risk_across_sources(
         header = _content_text(rendered.partition("POSITIONS ·")[0])
         assert "POSITION RISK $27.27" in header
         assert "LIMIT RISK $45.00" in header
-        assert "All limit fills → SL" in header
+        assert "All limit fills → SL" not in header
         assert "Risk incomplete" not in header
         assert max(map(len, rendered.splitlines())) <= width
         assert "…" not in rendered
@@ -457,7 +695,6 @@ def test_general_header_shows_position_and_additional_limit_risk_across_sources(
             segment.text.strip() == amount and segment.style.bold and segment.style.color.name == "white"
             for segment in segments
         )
-    assert any(segment.text.strip() == "All limit fills → SL" and segment.style.dim for segment in segments)
 
 
 @pytest.mark.parametrize(
@@ -532,7 +769,7 @@ def test_reducing_limits_and_empty_positions_have_confirmed_zero_risk() -> None:
         assert "Risk incomplete" not in header
     segments = list(console.render(render_snapshot(snapshot, refresh_seconds=15)))
     assert sum(
-        segment.text.strip() == "$0.00" and segment.style.bold and segment.style.color.name == "green"
+        segment.text.strip() == "$0.00" and segment.style.bold is True and segment.style.color.name == "green"
         for segment in segments
     ) == 2
 
@@ -667,10 +904,9 @@ def test_live_pager_keeps_header_and_navigation_fixed_at_45_by_24() -> None:
         assert "TOTAL UPNL" in rendered
         assert "POSITION RISK" in rendered
         assert "LIMIT RISK" in rendered
-        assert "All limit fills → SL" in rendered
         assert "+$120.95" in rendered
         assert f"Page {page}/{page_count}" in rendered
-        assert "←/→ n/p · q quit" in rendered.splitlines()[-1]
+        assert "←/→ n/p · m hide · q quit" in rendered.splitlines()[-1]
     assert "$11.21" in first
     assert "+$123.45" in first
     assert "Lighter · Sub 1" in "\n".join(pages[1:])
@@ -720,7 +956,7 @@ def test_mixed_exchange_pager_preserves_every_row_and_both_refresh_cadences() ->
         assert rendered[:header_height] == complete[:header_height]
         assert "Lighter 15s · UPNL 0.5s" in "\n".join(rendered[:header_height])
         assert "BingX REST 15s" in "\n".join(rendered[:header_height])
-        for metric in ("TOTAL UPNL", "POSITION RISK", "LIMIT RISK", "All limit fills → SL"):
+        for metric in ("TOTAL UPNL", "POSITION RISK", "LIMIT RISK"):
             assert metric in "\n".join(rendered[:header_height])
         body.extend(rendered[header_height:-1])
     assert body[: len(complete) - header_height] == complete[header_height:]

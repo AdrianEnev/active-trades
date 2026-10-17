@@ -4,7 +4,7 @@ from decimal import Decimal
 from unittest import TestCase
 
 from active_trades.models import AccountInfo, AccountSnapshot, ActiveTrade, LimitOrder, Position, StopOrder, TrackerSnapshot, Trade
-from active_trades.risk import find_protective_stop, infer_opened_at_from_trades, limit_risk_total, position_risk_total, risk_usd
+from active_trades.risk import find_protective_stop, infer_opened_at_from_trades, limit_order_risk_usd, limit_risk_total, position_risk_total, risk_usd
 
 
 class TestRisk(TestCase):
@@ -104,6 +104,16 @@ class TestRiskTotals(TestCase):
         position = Position(1, 10, "BTC", "long", Decimal("1"), Decimal("100"))
         return replace(ActiveTrade(1, position, None, "unknown", Decimal("90"), Decimal("10"), "at-risk"), **changes)
 
+    def close_all_stop(self, **changes):
+        return replace(self.stop(
+            remaining_base_amount=Decimal("0"), status="pending",
+            raw={
+                "initial_base_amount": "0", "remaining_base_amount": "0",
+                "filled_base_amount": "0", "base_size": 0,
+                "trigger_status": "mark-price", "parent_order_id": "0", "parent_order_index": 0,
+            },
+        ), **changes)
+
     def snapshot(self, *, trades=(), entries=(), stops=(), **account_changes):
         account = AccountSnapshot(
             AccountInfo(1), tuple(trades), limit_orders=tuple(entries), stop_orders=tuple(stops),
@@ -132,6 +142,69 @@ class TestRiskTotals(TestCase):
         covered = replace(snapshot.accounts[0], stop_orders=(self.stop(),))
         self.assertEqual(position_risk_total(replace(snapshot, accounts=(covered,))), (Decimal("10"), False))
 
+    def test_lighter_explicit_zero_size_active_stop_closes_whole_current_position(self):
+        for side in ("long", "short"):
+            with self.subTest(side=side):
+                trade = self.trade()
+                trade = replace(trade, position=replace(trade.position, side=side))
+                stop = self.close_all_stop()
+                if side == "short":
+                    stop = replace(stop, side="buy", trigger_price=Decimal("110"))
+                    trade = replace(trade, stop_loss=stop.trigger_price)
+                snapshot = self.snapshot(trades=(trade,), stops=(stop,))
+                self.assertEqual(find_protective_stop(trade.position, [stop])[:2], (stop, "at-risk"))
+                self.assertEqual(position_risk_total(snapshot), (Decimal("10"), False))
+
+    def test_zero_remaining_from_originally_sized_or_unknown_stop_is_not_close_all(self):
+        for raw in (
+            {"initial_base_amount": "1", "filled_base_amount": "1", "trigger_status": "mark-price"},
+            {"trigger_status": "mark-price"},
+            {"initial_base_amount": None, "trigger_status": "mark-price"},
+        ):
+            with self.subTest(raw=raw):
+                stop = self.stop(remaining_base_amount=Decimal("0"), raw=raw)
+                self.assertEqual(position_risk_total(self.snapshot(trades=(self.trade(),), stops=(stop,))), (None, True))
+        unknown_remaining = replace(self.close_all_stop(), remaining_base_amount=None)
+        self.assertEqual(position_risk_total(self.snapshot(trades=(self.trade(),), stops=(unknown_remaining,))), (None, True))
+
+    def test_lighter_close_all_waiting_for_parent_does_not_protect_current_position(self):
+        stop = self.close_all_stop()
+        stop = replace(stop, raw={**stop.raw, "trigger_status": "parent-order", "parent_order_id": 11})
+        trade = self.trade()
+        self.assertEqual(find_protective_stop(trade.position, [stop])[:2], (None, "missing"))
+        self.assertEqual(position_risk_total(self.snapshot(trades=(trade,), stops=(stop,))), (None, True))
+
+    def test_lighter_current_close_all_stop_does_not_guarantee_unrelated_future_entry(self):
+        stop = self.close_all_stop()
+        for trades in ((), (self.trade(),)):
+            with self.subTest(has_position=bool(trades)):
+                snapshot = self.snapshot(trades=trades, entries=(self.entry(order_id="unrelated"),), stops=(stop,))
+                if trades:
+                    self.assertEqual(position_risk_total(snapshot), (Decimal("10"), False))
+                self.assertEqual(limit_risk_total(snapshot), (None, True))
+
+    def test_five_position_total_includes_zk_active_zero_size_close_all_stop(self):
+        trades = []
+        stops = []
+        for market, value in enumerate(("20", "10.0003", "6.665", "4"), start=1):
+            risk = Decimal(value)
+            position = replace(self.trade().position, market_id=market, symbol=f"ASSET{market}")
+            stop = self.stop(market_id=market, trigger_price=position.avg_entry_price - risk)
+            trades.append(self.trade(position=position, stop_loss=stop.trigger_price, risk_usd=risk))
+            stops.append(stop)
+        zk_position = Position(1, 5, "ZK", "short", Decimal("6159"), Decimal("0.03"))
+        zk_stop = replace(self.close_all_stop(), market_id=5, side="buy", trigger_price=Decimal("0.031299"))
+        zk_risk = risk_usd(zk_position, zk_stop)
+        self.assertEqual(zk_risk, Decimal("8.000541"))
+        trades.append(self.trade(position=zk_position, stop_loss=zk_stop.trigger_price, risk_usd=zk_risk))
+        stops.append(zk_stop)
+        snapshot = self.snapshot(trades=trades, stops=stops)
+        self.assertEqual(position_risk_total(snapshot), (Decimal("48.665841"), False))
+
+        undersized = replace(zk_stop, remaining_base_amount=Decimal("6000"), raw={"initial_base_amount": "6000"})
+        account = replace(snapshot.accounts[0], stop_orders=(*stops[:-1], undersized))
+        self.assertEqual(position_risk_total(replace(snapshot, accounts=(account,))), (Decimal("40.6653"), True))
+
     def test_current_positions_cannot_use_a_child_stop_waiting_for_its_entry(self):
         child = self.stop(raw={"trigger_status": "parent-order", "parent_order_id": 11})
         trade = self.trade()
@@ -153,7 +226,10 @@ class TestRiskTotals(TestCase):
     def test_attached_stops_use_remaining_quantity_and_both_directions(self):
         long = self.entry(remaining_base_amount=Decimal("0.5"), stop_loss=Decimal("90"), raw={"initial_base_amount": "2"})
         short = self.entry(side="sell", price=Decimal("120"), remaining_base_amount=Decimal("2"), stop_loss=Decimal("130"))
-        self.assertEqual(limit_risk_total(self.snapshot(entries=(long, short))), (Decimal("25"), False))
+        snapshot = self.snapshot(entries=(long, short))
+        self.assertEqual(limit_order_risk_usd(long, snapshot.accounts[0]), Decimal("5"))
+        self.assertEqual(limit_order_risk_usd(short, snapshot.accounts[0]), Decimal("20"))
+        self.assertEqual(limit_risk_total(snapshot), (Decimal("25"), False))
 
     def test_attached_stop_quantity_must_cover_the_whole_partially_filled_entry(self):
         entry = self.entry(
@@ -165,7 +241,20 @@ class TestRiskTotals(TestCase):
 
     def test_reducing_limits_do_not_add_entry_risk(self):
         entry = self.entry(reduce_only=True)
-        self.assertEqual(limit_risk_total(self.snapshot(entries=(entry,))), (Decimal("0"), False))
+        snapshot = self.snapshot(entries=(entry,))
+        self.assertEqual(limit_order_risk_usd(entry, snapshot.accounts[0]), Decimal("0"))
+        self.assertEqual(limit_risk_total(snapshot), (Decimal("0"), False))
+
+    def test_individual_limit_risk_distinguishes_missing_coverage_and_confirmed_zero(self):
+        for entry, expected in (
+            (self.entry(), None),
+            (self.entry(stop_loss=Decimal("90"), stop_loss_quantity=Decimal("0.5")), None),
+            (self.entry(stop_loss=Decimal("100")), Decimal("0")),
+            (self.entry(side="sell", stop_loss=Decimal("90")), Decimal("0")),
+        ):
+            with self.subTest(entry=entry):
+                account = self.snapshot(entries=(entry,)).accounts[0]
+                self.assertEqual(limit_order_risk_usd(entry, account), expected)
 
     def test_linked_lighter_zero_size_child_covers_its_parent_entry(self):
         for entry, stop in (
@@ -173,7 +262,9 @@ class TestRiskTotals(TestCase):
             (self.entry(raw={"to_trigger_order_id_0": 22}), self.stop(order_id="22", remaining_base_amount=Decimal("0"))),
         ):
             with self.subTest(entry=entry):
-                self.assertEqual(limit_risk_total(self.snapshot(entries=(entry,), stops=(stop,))), (Decimal("10"), False))
+                snapshot = self.snapshot(entries=(entry,), stops=(stop,))
+                self.assertEqual(limit_order_risk_usd(entry, snapshot.accounts[0]), Decimal("10"))
+                self.assertEqual(limit_risk_total(snapshot), (Decimal("10"), False))
 
     def test_unrelated_or_inactive_stops_cannot_protect_pending_entries(self):
         entry = self.entry(order_id="11")
@@ -191,8 +282,10 @@ class TestRiskTotals(TestCase):
             self.entry(price=Decimal("110"), remaining_base_amount=Decimal("0.5")),
         )
         snapshot = self.snapshot(trades=(self.trade(),), entries=entries, stops=(self.stop(),))
+        self.assertEqual([limit_order_risk_usd(entry, snapshot.accounts[0]) for entry in entries], [None, None])
         self.assertEqual(limit_risk_total(snapshot), (None, True))
         covered = replace(snapshot.accounts[0], stop_orders=(self.stop(remaining_base_amount=Decimal("2")),))
+        self.assertEqual([limit_order_risk_usd(entry, covered) for entry in entries], [Decimal("5"), Decimal("10")])
         self.assertEqual(limit_risk_total(replace(snapshot, accounts=(covered,))), (Decimal("15"), False))
 
     def test_shared_stop_capacity_tracks_live_position_growth_and_closure(self):

@@ -4,6 +4,9 @@
 !.env.example
 *.pem
 *.key
+*service-account*.json
+credentials.json
+trading-log-spreadsheets-*.json
 
 # Local account state and logs.
 state/

@@ -1,13 +1,19 @@
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
 
+import pytest
+
 from active_trades.lighter_api import (
+    AuthUnavailable,
     LighterApiError,
     LighterRestClient,
+    cancel_orders,
     limit_orders_from_dicts,
     position_from_dict,
+    signing_key_for,
     stop_order_from_dict,
     trade_from_dict,
 )
@@ -86,6 +92,26 @@ class TestLighterApiParsing(TestCase):
                     account_index=9,
                 )
                 self.assertIsNone(position.unrealized_pnl)
+
+    def test_position_parses_realized_pnl_counter_without_zero_fallback(self):
+        for value in (0, "0", "0.00", "123.456789", "-123.456789"):
+            with self.subTest(value=value):
+                position = position_from_dict(
+                    {
+                        "market_id": 3, "position": "2", "avg_entry_price": "180",
+                        "realized_pnl": value, "unrealized_pnl": "99",
+                    },
+                    account_index=9,
+                )
+                self.assertEqual(position.realized_pnl, Decimal(str(value)))
+
+    def test_position_missing_or_invalid_realized_pnl_is_unknown(self):
+        base = {"market_id": 3, "position": "2", "avg_entry_price": "180"}
+        self.assertIsNone(position_from_dict(base, account_index=9).realized_pnl)
+        for value in (None, "", "invalid", "NaN", "Infinity", "-Infinity"):
+            with self.subTest(value=value):
+                position = position_from_dict({**base, "realized_pnl": value}, account_index=9)
+                self.assertIsNone(position.realized_pnl)
 
     def test_limit_order_uses_remaining_size_is_ask_symbol_and_creation_time(self):
         raw = {
@@ -207,3 +233,73 @@ class TestMarketSymbols(TestCase):
             with self.subTest(payload=payload), patch.object(client, "get_json", return_value=payload):
                 with self.assertRaises(LighterApiError):
                     client.fetch_market_symbols()
+
+
+class FakeSigner:
+    instances = []
+
+    def __init__(self, *, url, account_index, api_private_keys):
+        self.url = url
+        self.account_index = account_index
+        self.api_private_keys = api_private_keys
+        self.cancelled = []
+        self.closed = False
+        FakeSigner.instances.append(self)
+
+    async def cancel_order(self, *, market_index, order_index):
+        self.cancelled.append((market_index, order_index))
+        if order_index == 2:
+            return None, SimpleNamespace(code=21500, message="order not found"), None
+        if order_index == 3:
+            raise RuntimeError("HTTP 400\nBad Request\ninvalid nonce")
+        if order_index == 4:
+            return None, None, "invalid signature"
+        return None, SimpleNamespace(code=200, message=None), None
+
+    async def close(self):
+        self.closed = True
+
+
+def test_cancel_orders_reports_each_submission_and_closes_the_signer(monkeypatch):
+    import lighter
+
+    FakeSigner.instances.clear()
+    monkeypatch.setattr(lighter, "SignerClient", FakeSigner)
+    errors = cancel_orders(
+        base_url="https://lighter.example", account_index=7, api_private_key="private",
+        api_key_index=3, market_index=1, order_indexes=[1, 2, 3, 4],
+    )
+    assert errors == [None, "order not found", "invalid nonce", "invalid signature"]
+    [signer] = FakeSigner.instances
+    assert signer.account_index == 7
+    assert signer.api_private_keys == {3: "private"}
+    assert signer.cancelled == [(1, 1), (1, 2), (1, 3), (1, 4)]
+    assert signer.closed
+
+
+def test_cancel_orders_wraps_signer_setup_failures(monkeypatch):
+    import lighter
+
+    def broken(**_kwargs):
+        raise ValueError("private key does not match api key index")
+
+    monkeypatch.setattr(lighter, "SignerClient", broken)
+    with pytest.raises(LighterApiError, match="could not be signed or sent: private key does not match"):
+        cancel_orders(
+            base_url="https://lighter.example", account_index=7, api_private_key="private",
+            api_key_index=3, market_index=1, order_indexes=[1],
+        )
+
+
+def test_signing_key_is_per_account_and_read_only_tokens_cannot_sign(monkeypatch):
+    for name in ("LIGHTER_ACCOUNT_7_API_PRIVATE_KEY", "LIGHTER_ACCOUNT_7_API_KEY_INDEX",
+                 "LIGHTER_ACCOUNT_9_API_PRIVATE_KEY", "LIGHTER_ACCOUNT_9_API_KEY_INDEX"):
+        monkeypatch.delenv(name, raising=False)
+    base = {"default_account_index": 7, "api_private_key": "base", "api_key_index": 3}
+    assert signing_key_for(7, **base) == ("base", 3)
+    monkeypatch.setenv("LIGHTER_ACCOUNT_9_READ_ONLY_AUTH_TOKEN", "ro")
+    with pytest.raises(AuthUnavailable, match="LIGHTER_ACCOUNT_9_API_PRIVATE_KEY"):
+        signing_key_for(9, **base)
+    monkeypatch.setenv("LIGHTER_ACCOUNT_9_API_PRIVATE_KEY", "sub")
+    monkeypatch.setenv("LIGHTER_ACCOUNT_9_API_KEY_INDEX", "5")
+    assert signing_key_for(9, **base) == ("sub", 5)

@@ -40,6 +40,7 @@ class Position:
     raw: dict[str, Any] | None = None
     exchange: str = "lighter"
     position_id: str = ""
+    realized_pnl: Decimal | None = None
 
     @property
     def key(self) -> str:
@@ -108,6 +109,7 @@ class ActiveTrade:
     risk_usd: Decimal | None
     risk_state: str = ""
     risk_note: str = ""
+    profit_target_reached: bool = False
 
 
 @dataclass(frozen=True)

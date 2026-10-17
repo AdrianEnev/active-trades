@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from active_trades.models import Position
 
@@ -11,6 +12,7 @@ class PositionStateStore:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self._opened_at_by_key: dict[str, str] = {}
+        self._profit_tracking: dict[str, Any] = {}
         self._loaded = False
 
     def load(self) -> None:
@@ -24,6 +26,9 @@ class PositionStateStore:
         except (OSError, json.JSONDecodeError):
             return
         positions = payload.get("positions") if isinstance(payload, dict) else None
+        profit_tracking = payload.get("profit_tracking") if isinstance(payload, dict) else None
+        if isinstance(profit_tracking, dict):
+            self._profit_tracking = profit_tracking
         if not isinstance(positions, dict):
             return
         self._opened_at_by_key = {
@@ -55,8 +60,21 @@ class PositionStateStore:
             key: value for key, value in self._opened_at_by_key.items() if key in active_positions
         }
 
+    def profit_tracking(self) -> dict[str, Any]:
+        self.load()
+        return self._profit_tracking
+
+    def remember_profit_tracking(self, payload: dict[str, Any]) -> None:
+        self.load()
+        self._profit_tracking = payload
+
     def save(self) -> None:
         self.load()
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"positions": dict(sorted(self._opened_at_by_key.items()))}
-        self.path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        payload = {
+            "positions": dict(sorted(self._opened_at_by_key.items())),
+            "profit_tracking": self._profit_tracking,
+        }
+        temporary = self.path.with_name(f".{self.path.name}.tmp")
+        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        temporary.replace(self.path)

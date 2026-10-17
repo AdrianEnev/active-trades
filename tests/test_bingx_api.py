@@ -220,6 +220,19 @@ class TestBingxParsing(TestCase):
             with self.subTest(value=value):
                 self.assertIsNone(positions_from_dicts([{**self.position, "unrealizedProfit": value}])[0].unrealized_pnl)
 
+    def test_positions_parse_realised_profit_counter_without_zero_fallback(self):
+        for value in (0, "0", "0.00", "123.456789", "-123.456789"):
+            with self.subTest(value=value):
+                position = positions_from_dicts([{**self.position, "realisedProfit": value}])[0]
+                self.assertEqual(position.realized_pnl, Decimal(str(value)))
+
+    def test_positions_missing_or_invalid_realised_profit_is_unknown(self):
+        self.assertIsNone(positions_from_dicts([self.position])[0].realized_pnl)
+        for value in (None, "", "invalid", "NaN", "Infinity", "-Infinity"):
+            with self.subTest(value=value):
+                position = positions_from_dicts([{**self.position, "realisedProfit": value}])[0]
+                self.assertIsNone(position.realized_pnl)
+
     def test_limit_preserves_remaining_amount_creation_time_and_large_id(self):
         order = limit_orders_from_dicts([self.limit])[0]
         self.assertEqual(order.exchange, "bingx")
@@ -316,6 +329,21 @@ class TestBingxParsing(TestCase):
         self.assertTrue(market.reduce_only)
         self.assertEqual(market.raw["positionID"], "12345678901234567890")
 
+    def test_journal_can_include_take_profit_market_and_limit_triggers(self):
+        market, limit = stop_orders_from_dicts([
+            {**self.stop, "type": "TAKE_PROFIT_MARKET", "origQty": "0", "closePosition": "true"},
+            {**self.stop, "type": "TAKE_PROFIT"},
+        ], include_take_profit=True)
+        self.assertEqual((market.order_type, limit.order_type), ("take-profit", "take-profit-limit"))
+        self.assertIsNone(market.remaining_base_amount)
+        self.assertTrue(market.reduce_only)
+        self.assertEqual(market.trigger_price, Decimal("66000"))
+
+    def test_journal_tp_parser_still_rejects_inactive_and_invalid_orders(self):
+        raw = {**self.stop, "type": "TAKE_PROFIT_MARKET"}
+        invalid = [{**raw, "status": "FILLED"}, {**raw, "stopPrice": "NaN"}, {**raw, "origQty": "0"}]
+        self.assertEqual(stop_orders_from_dicts(invalid, include_take_profit=True), [])
+
     def test_stop_classifies_only_closing_hedge_direction_as_reducing(self):
         cases = [("LONG", "SELL", True), ("SHORT", "BUY", True), ("LONG", "BUY", False), ("SHORT", "SELL", False)]
         for position_side, side, expected in cases:
@@ -349,3 +377,37 @@ class TestBingxParsing(TestCase):
         for value in (None, "bad", "NaN", "-1", 10 ** 500):
             with self.subTest(value=value):
                 self.assertIsNone(limit_orders_from_dicts([{**self.limit, "time": value}])[0].created_at)
+
+
+class TestBingxCancelOrder(TestCase):
+    def setUp(self):
+        self.client = BingxRestClient(api_key="test-api-key", api_secret="test-api-secret")
+
+    def test_cancel_sends_signed_delete_for_one_symbol_and_order(self):
+        with (
+            patch("active_trades.bingx_api.time.time", return_value=1_728_000_000.123),
+            patch("active_trades.bingx_api.urlopen", return_value=TestBingxRestClient.response({"code": 0, "data": {}})) as send,
+        ):
+            self.client.cancel_order(symbol="BTC-USDT", order_id="12345678901234567890")
+
+        request = send.call_args.args[0]
+        self.assertEqual(request.get_method(), "DELETE")
+        self.assertEqual(urlsplit(request.full_url).path, "/openApi/swap/v2/trade/order")
+        canonical = "orderId=12345678901234567890&recvWindow=5000&symbol=BTC-USDT&timestamp=1728000000123"
+        signature = hmac.new(b"test-api-secret", canonical.encode(), hashlib.sha256).hexdigest()
+        self.assertEqual(urlsplit(request.full_url).query, f"{canonical}&signature={signature}")
+
+    def test_read_only_key_gets_a_trade_permission_message(self):
+        with patch("active_trades.bingx_api.urlopen", return_value=TestBingxRestClient.response({"code": 100004})):
+            with self.assertRaisesRegex(BingxAuthUnavailable, "cannot trade; enable perpetual futures trading"):
+                self.client.cancel_order(symbol="BTC-USDT", order_id="1")
+
+    def test_cancel_of_a_missing_order_says_it_may_have_filled(self):
+        with patch("active_trades.bingx_api.urlopen", return_value=TestBingxRestClient.response({"code": 109421})):
+            with self.assertRaisesRegex(BingxApiError, "may have filled or been cancelled"):
+                self.client.cancel_order(symbol="BTC-USDT", order_id="1")
+
+    def test_rejected_cancel_is_not_described_as_a_read(self):
+        with patch("active_trades.bingx_api.urlopen", return_value=TestBingxRestClient.response({"code": 101204})):
+            with self.assertRaisesRegex(BingxApiError, "the request was rejected"):
+                self.client.cancel_order(symbol="BTC-USDT", order_id="1")

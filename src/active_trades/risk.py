@@ -48,7 +48,7 @@ def find_protective_stop(position: Position, orders: list[StopOrder]) -> tuple[S
     return fallback, "unknown", "SL side unclear"
 
 
-def _matches_position(position: Position, order: StopOrder) -> bool:
+def _matches_position(position: Position, order: StopOrder | LimitOrder) -> bool:
     if position.exchange != "bingx":
         return True
     raw = order.raw or {}
@@ -90,7 +90,7 @@ def limit_risk_total(snapshot: TrackerSnapshot) -> tuple[Decimal | None, bool]:
     for account in snapshot.accounts:
         incomplete = incomplete or account.orders_state != "available"
         values.extend(
-            _limit_risk_value(order, account)
+            limit_order_risk_usd(order, account)
             for order in account.limit_orders
             if not order.reduce_only
         )
@@ -116,7 +116,7 @@ def _position_risk_value(trade: ActiveTrade, account: AccountSnapshot) -> Decima
     ]
     if account.stop_orders and trade.stop_loss is not None and not matching:
         return None
-    if matching and not any(_closes_whole_position(stop) for stop in matching):
+    if matching and not any(_closes_current_position(stop) for stop in matching):
         capacity = sum((stop.remaining_base_amount or Decimal("0") for stop in matching), Decimal("0"))
         position = trade.position
         exposure = sum((
@@ -130,7 +130,10 @@ def _position_risk_value(trade: ActiveTrade, account: AccountSnapshot) -> Decima
     return trade.risk_usd
 
 
-def _limit_risk_value(order: LimitOrder, account: AccountSnapshot) -> Decimal | None:
+def limit_order_risk_usd(order: LimitOrder, account: AccountSnapshot) -> Decimal | None:
+    """Additional downside if this remaining limit fills and reaches its SL."""
+    if order.reduce_only:
+        return Decimal("0")
     if order.stop_loss is not None:
         if order.stop_loss_quantity is not None and order.stop_loss_quantity < _entry_quantity(order):
             return None
@@ -212,6 +215,23 @@ def _valid_stop(stop: StopOrder, account_index: int, exchange: str, market_id: i
 def _closes_whole_position(stop: StopOrder) -> bool:
     raw = stop.raw or {}
     return stop.exchange == "bingx" and str(raw.get("closePosition", "")).lower() in {"true", "1"}
+
+
+def _closes_current_position(stop: StopOrder) -> bool:
+    if _closes_whole_position(stop):
+        return True
+    if (
+        stop.exchange != "lighter" or not stop.reduce_only
+        or stop.remaining_base_amount != 0 or _awaits_entry(stop)
+    ):
+        return False
+    # Lighter position-tied SLs encode a dynamic position size as zero. An
+    # exhausted sized order also has zero remaining, so verify its original size.
+    raw = stop.raw or {}
+    try:
+        return all(Decimal(str(raw.get(name))) == 0 for name in ("initial_base_amount", "filled_base_amount"))
+    except (ArithmeticError, ValueError):
+        return False
 
 
 def _awaits_entry(stop: StopOrder) -> bool:

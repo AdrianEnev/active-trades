@@ -133,6 +133,88 @@ class AuthProvider:
         return asyncio.run(create_token())
 
 
+def signing_key_for(
+    account_index: int,
+    *,
+    default_account_index: int | None,
+    api_private_key: str | None,
+    api_key_index: int | None,
+) -> tuple[str, int]:
+    """API key pair able to sign transactions for one account; read-only tokens cannot."""
+    account_private_key = os.getenv(f"LIGHTER_ACCOUNT_{account_index}_API_PRIVATE_KEY")
+    raw_api_key_index = os.getenv(f"LIGHTER_ACCOUNT_{account_index}_API_KEY_INDEX")
+    if account_private_key and raw_api_key_index:
+        parsed_index = _parse_int(raw_api_key_index)
+        if parsed_index is not None:
+            return account_private_key, parsed_index
+    # API keys are scoped to one account index, so the base pair only signs for the base account.
+    if account_index == default_account_index and api_private_key and api_key_index is not None:
+        return api_private_key, api_key_index
+    raise AuthUnavailable(
+        f"Cancelling needs LIGHTER_ACCOUNT_{account_index}_API_PRIVATE_KEY and "
+        f"LIGHTER_ACCOUNT_{account_index}_API_KEY_INDEX; a read-only token cannot cancel."
+    )
+
+
+def cancel_orders(
+    *,
+    base_url: str,
+    account_index: int,
+    api_private_key: str,
+    api_key_index: int,
+    market_index: int,
+    order_indexes: list[int],
+) -> list[str | None]:
+    """Submit one signed cancel per order, in order; returns each submission's error or None.
+
+    Acceptance means Lighter queued the transaction, not that the order has left the book.
+    """
+    try:
+        import lighter
+    except ImportError as exc:
+        raise AuthUnavailable(
+            "lighter-sdk is required to cancel orders. Install this project with `pip install -e .`."
+        ) from exc
+
+    async def submit() -> list[str | None]:
+        signer = lighter.SignerClient(
+            url=base_url,
+            account_index=account_index,
+            api_private_keys={api_key_index: api_private_key},
+        )
+        errors: list[str | None] = []
+        try:
+            for order_index in order_indexes:
+                try:
+                    _tx, response, error = await signer.cancel_order(
+                        market_index=market_index, order_index=order_index
+                    )
+                except Exception as exc:  # The SDK raises its own transport and API exceptions.
+                    response, error = None, _last_line(exc)
+                if error is None and response is None:
+                    error = "no response"
+                elif error is None and getattr(response, "code", 200) != 200:
+                    error = getattr(response, "message", None) or f"response code {response.code}"
+                errors.append(str(error)[:200] if error is not None else None)
+        finally:
+            close = getattr(signer, "close", None)
+            if callable(close):
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+        return errors
+
+    try:
+        return asyncio.run(submit())
+    except Exception as exc:
+        raise LighterApiError(f"Lighter cancel could not be signed or sent: {_last_line(exc)}") from None
+
+
+def _last_line(exc: Exception) -> str:
+    lines = str(exc).strip().splitlines()
+    return lines[-1] if lines else type(exc).__name__
+
+
 class LighterRestClient:
     def __init__(self, *, base_url: str, timeout_seconds: int = 15) -> None:
         self.base_url = base_url.rstrip("/")
@@ -220,14 +302,28 @@ class LighterRestClient:
                 symbols[market_id] = symbol
         return symbols
 
+    def fetch_inactive_orders(self, account_index: int, authorization: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Most recent filled or cancelled orders, including triggered SL/TP orders."""
+        payload = self.get_json(
+            "/api/v1/accountInactiveOrders",
+            query={"account_index": account_index, "market_type": "perp", "limit": max(1, min(100, limit))},
+            headers={"authorization": authorization},
+        )
+        _raise_for_lighter_code(payload, "inactive-order lookup")
+        orders = payload.get("orders") or []
+        if not isinstance(orders, list):
+            raise LighterApiError("inactive-order lookup returned an unexpected payload.")
+        return [object_to_dict(order) for order in orders]
+
     def fetch_trades(
         self,
         *,
         account_index: int,
-        market_id: int,
+        market_id: int | None,
         authorization: str,
         limit: int,
     ) -> list[dict[str, Any]]:
+        """Recent fills for one market, or for every market when market_id is None."""
         payload = self.get_json(
             "/api/v1/trades",
             query={
@@ -344,6 +440,7 @@ def position_from_dict(raw: dict[str, Any], *, account_index: int) -> Position |
             raw.get("unrealized_pnl") if raw.get("unrealized_pnl") is not None else raw.get("pnl")
         ),
         raw=raw,
+        realized_pnl=_decimal_or_none(raw.get("realized_pnl")),
     )
 
 

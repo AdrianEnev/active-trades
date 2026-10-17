@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 import shutil
+from contextvars import ContextVar
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -8,10 +10,15 @@ from textwrap import wrap
 from typing import Any
 
 from active_trades.models import AccountSnapshot, ActiveTrade, LimitOrder, TrackerSnapshot
-from active_trades.risk import limit_risk_total, position_risk_total
+from active_trades.order_cancel import CancelPrompt, exit_kind, exit_price, numbered_limit_orders
+from active_trades.risk import limit_order_risk_usd, limit_risk_total, position_risk_total
 
 TradeRow = tuple[ActiveTrade, str]
-OrderRow = tuple[LimitOrder, str]
+OrderRow = tuple[LimitOrder, str, Decimal | None]
+
+_HIDE_AMOUNTS: ContextVar[bool] = ContextVar("hide_amounts", default=False)
+_MASKED_AMOUNT = "****"
+_DOLLAR_AMOUNT = re.compile(r"[+-]?\$\s*[+-]?(?:\d[\d,]*(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?")
 
 try:
     from rich import box
@@ -36,6 +43,9 @@ def render_snapshot(
     pnl_refresh_seconds: float = 0.5,
     live: bool = False,
     page: int | None = None,
+    hide_amounts: bool = False,
+    email_alerts: bool | None = None,
+    cancel_prompt: CancelPrompt | None = None,
 ) -> Any:
     if not (Group and Panel and Table and Text):
         return render_plain(
@@ -43,8 +53,13 @@ def render_snapshot(
             refresh_seconds=refresh_seconds,
             pnl_refresh_seconds=pnl_refresh_seconds,
             live=live,
+            hide_amounts=hide_amounts,
+            email_alerts=email_alerts,
+            cancel_prompt=cancel_prompt,
         )
-    return _SnapshotRenderable(snapshot, refresh_seconds, pnl_refresh_seconds, live, page)
+    return _SnapshotRenderable(
+        snapshot, refresh_seconds, pnl_refresh_seconds, live, page, hide_amounts, email_alerts, cancel_prompt
+    )
 
 
 class _SnapshotRenderable:
@@ -57,25 +72,37 @@ class _SnapshotRenderable:
         pnl_refresh_seconds: float,
         live: bool,
         page: int | None,
+        hide_amounts: bool,
+        email_alerts: bool | None = None,
+        cancel_prompt: CancelPrompt | None = None,
     ) -> None:
         self.snapshot = snapshot
         self.refresh_seconds = refresh_seconds
         self.pnl_refresh_seconds = pnl_refresh_seconds
         self.live = live
         self.page = page
+        self.hide_amounts = hide_amounts
+        self.email_alerts = email_alerts
+        self.cancel_prompt = cancel_prompt
 
     def __rich_console__(self, console: Any, options: Any) -> Any:
-        dashboard = _render_rich(
-            self.snapshot,
-            refresh_seconds=self.refresh_seconds,
-            pnl_refresh_seconds=self.pnl_refresh_seconds,
-            live=self.live,
-            width=options.max_width,
-        )
-        if self.page is None:
-            yield dashboard
-        else:
-            yield from _render_page(console, options, dashboard, self.page)
+        token = _HIDE_AMOUNTS.set(self.hide_amounts)
+        try:
+            dashboard = _render_rich(
+                self.snapshot,
+                refresh_seconds=self.refresh_seconds,
+                pnl_refresh_seconds=self.pnl_refresh_seconds,
+                live=self.live,
+                width=options.max_width,
+                email_alerts=self.email_alerts,
+                cancel_prompt=self.cancel_prompt,
+            )
+            # Finish formatting before yielding, so a paused render cannot leak
+            # its privacy mode into a different dashboard in the same context.
+            renderables = [dashboard] if self.page is None else list(_render_page(console, options, dashboard, self.page))
+        finally:
+            _HIDE_AMOUNTS.reset(token)
+        yield from renderables
 
 
 def _render_page(console: Any, options: Any, dashboard: Any, page: int) -> Any:
@@ -96,7 +123,16 @@ def _render_page(console: Any, options: Any, dashboard: Any, page: int) -> Any:
         yield Segment.line()
     for _ in range(body_height - len(visible)):
         yield Segment.line()
-    yield Text(f"Page {page_index + 1}/{page_count} · ←/→ n/p · q quit", style="dim", no_wrap=True, overflow="crop")
+    action = "show" if _HIDE_AMOUNTS.get() else "hide"
+    page_label = f"{page_index + 1}/{page_count}"
+    footers = (
+        f"Page {page_label} · ←/→ n/p · c cancel · m {action} · q quit",
+        f"Page {page_label} · ←/→ n/p · m {action} · q quit",
+        f"{page_label} ←/→ n/p m {action} q quit",
+        f"{page_label} n/p m {action} q",
+    )
+    footer = next((footer for footer in footers if len(footer) <= options.max_width), footers[-1])
+    yield Text(footer, style="dim", no_wrap=True, overflow="crop")
 
 
 def _render_rich(
@@ -106,6 +142,8 @@ def _render_rich(
     pnl_refresh_seconds: float,
     live: bool,
     width: int,
+    email_alerts: bool | None = None,
+    cancel_prompt: CancelPrompt | None = None,
 ) -> Any:
     renderables: list[Any] = [
         _header_panel(
@@ -114,6 +152,8 @@ def _render_rich(
             pnl_refresh_seconds=pnl_refresh_seconds,
             live=live,
             width=width,
+            email_alerts=email_alerts,
+            cancel_prompt=cancel_prompt,
         )
     ]
 
@@ -154,6 +194,34 @@ def render_plain(
     pnl_refresh_seconds: float = 0.5,
     live: bool = False,
     width: int | None = None,
+    hide_amounts: bool = False,
+    email_alerts: bool | None = None,
+    cancel_prompt: CancelPrompt | None = None,
+) -> str:
+    token = _HIDE_AMOUNTS.set(hide_amounts)
+    try:
+        return _render_plain(
+            snapshot,
+            refresh_seconds=refresh_seconds,
+            pnl_refresh_seconds=pnl_refresh_seconds,
+            live=live,
+            width=width,
+            email_alerts=email_alerts,
+            cancel_prompt=cancel_prompt,
+        )
+    finally:
+        _HIDE_AMOUNTS.reset(token)
+
+
+def _render_plain(
+    snapshot: TrackerSnapshot,
+    *,
+    refresh_seconds: float,
+    pnl_refresh_seconds: float,
+    live: bool,
+    width: int | None,
+    email_alerts: bool | None = None,
+    cancel_prompt: CancelPrompt | None = None,
 ) -> str:
     width = width or shutil.get_terminal_size((100, 24)).columns
     width = max(28, width)
@@ -170,6 +238,11 @@ def render_plain(
         lines.append(f"● {status}   {total_trades} OPEN POSITIONS   {len(snapshot.accounts)} ACCOUNTS")
         lines.append(f"Updated {_fmt_datetime(snapshot.collected_at, seconds=True)}")
     lines.extend(_cadence_lines(snapshot, refresh_seconds, pnl_refresh_seconds))
+    if email_alerts is not None:
+        lines.append(_email_alerts_label(email_alerts))
+    if cancel_prompt is not None:
+        lines.append("")
+        lines.extend(text for text, _style in _cancel_prompt_lines(cancel_prompt))
     total_pnl, incomplete = _total_pnl(snapshot)
     lines.extend(("", f"{'TOTAL UPNL':<13}  {_fmt_pnl(total_pnl)}"))
     if incomplete:
@@ -179,7 +252,6 @@ def render_plain(
     lines.extend((
         f"POSITION RISK  {_risk_total_label(position_risk, positions_incomplete)}",
         f"{'LIMIT RISK':<13}  {_risk_total_label(limit_risk, limits_incomplete)}",
-        "All limit fills → SL",
     ))
     if positions_incomplete or limits_incomplete:
         lines.append("Risk incomplete: SL/data")
@@ -209,7 +281,7 @@ def render_plain(
             lines.append(f"    {source}")
     lines.extend(message for message, _available in _source_states(snapshot, kind="positions"))
     lines.extend(("", f"LIMIT ORDERS · {len(orders)} OPEN"))
-    for number, (order, source) in enumerate(orders, start=1):
+    for number, (order, source, risk) in enumerate(orders, start=1):
         lines.append(f"{number:>2} {order.symbol} {order.side.upper()}")
         lines.append(f"   {source}")
         details = f"   Limit {_fmt_price(order.price)} · Size {_fmt_decimal(order.remaining_base_amount)}"
@@ -217,6 +289,7 @@ def render_plain(
             lines.append(details)
         else:
             lines.extend((f"   Limit {_fmt_price(order.price)}", f"   Size {_fmt_decimal(order.remaining_base_amount)}"))
+        lines.append(f"   Risk {_fmt_money(risk)}")
         if order.reduce_only:
             lines.append("   Reduce only")
     lines.extend(message for message, _available in _source_states(snapshot, kind="orders"))
@@ -230,6 +303,8 @@ def _header_panel(
     pnl_refresh_seconds: float,
     live: bool,
     width: int,
+    email_alerts: bool | None = None,
+    cancel_prompt: CancelPrompt | None = None,
 ) -> Any:
     total_trades = sum(len(account.trades) for account in snapshot.accounts)
     status = Text("● LIVE", style="bold green") if live else Text("● SNAPSHOT", style="bold cyan")
@@ -245,6 +320,11 @@ def _header_panel(
         style="dim",
     )
     cadences = [Text(line, style="dim") for line in _cadence_lines(snapshot, refresh_seconds, pnl_refresh_seconds)]
+    if email_alerts is not None:
+        cadences.append(Text(_email_alerts_label(email_alerts), style="bold green" if email_alerts else "dim"))
+    if cancel_prompt is not None:
+        cadences.append(Text(""))
+        cadences.extend(Text(text, style=style) for text, style in _cancel_prompt_lines(cancel_prompt))
     return Panel(
         Group(first_line, second_line, *cadences, Text(""), _total_pnl_summary(snapshot), _risk_summary(snapshot)),
         title="ACTIVE TRADES",
@@ -254,6 +334,52 @@ def _header_panel(
         padding=(0, 1),
         expand=True,
     )
+
+
+def _email_alerts_label(enabled: bool) -> str:
+    return "Email alerts ON · TP/SL · Ctrl+E off" if enabled else "Email alerts off · Ctrl+E on"
+
+
+_MAX_LISTED_EXITS = 4
+
+
+def _cancel_prompt_lines(prompt: CancelPrompt) -> list[tuple[str, str]]:
+    """Prompt text and styles. Prices stay visible while amounts are hidden, as in the tables."""
+    if prompt.stage == "select":
+        hint = f"{prompt.hint} " if prompt.hint else ""
+        return [
+            (f"{hint}CANCEL LIMIT ORDER #{prompt.digits}_", "bold yellow"),
+            ("Type its # · Enter review · Esc back", "dim"),
+        ]
+    plan = prompt.plan
+    assert plan is not None
+    entry = plan.entry
+    order = (
+        f"{_mask_dollar_literals(entry.symbol)} {entry.side.upper()} "
+        f"{_fmt_decimal(entry.remaining_base_amount)} @ {_fmt_price(entry.price)}"
+    )
+    if prompt.stage == "busy":
+        return [(f"Cancelling {order}…", "bold yellow")]
+    lines = [
+        (f"CANCEL #{prompt.number} {order}", "bold yellow"),
+        (_mask_dollar_literals(plan.source), "dim"),
+    ]
+    if plan.exits:
+        listed = ", ".join(
+            f"{exit_kind(exit_order)} {_fmt_price(exit_price(exit_order))}"
+            for exit_order in plan.exits[:_MAX_LISTED_EXITS]
+        )
+        more = len(plan.exits) - _MAX_LISTED_EXITS
+        lines.append((f"Also cancels {listed}{f' +{more} more' if more > 0 else ''}", "yellow"))
+    elif not plan.entry.reduce_only:
+        lines.append(("No SL/TP to cancel", "dim"))
+    if plan.kept:
+        reason = "positions unavailable" if plan.positions_unknown else "protect position/other limits"
+        lines.append((f"Keeps {plan.kept} SL/TP ({reason})", "dim"))
+    if plan.filled:
+        lines.append((f"Partly filled {_fmt_decimal(plan.filled)}: check that position's SL", "yellow"))
+    lines.append(("y confirm · n back", "bold"))
+    return lines
 
 
 def _total_pnl(snapshot: TrackerSnapshot) -> tuple[Decimal | None, bool]:
@@ -308,7 +434,6 @@ def _risk_summary(snapshot: TrackerSnapshot) -> Any:
             ("LIMIT RISK", limit_risk, limits_incomplete),
         )
     ]
-    contents.append(Text("All limit fills → SL", style="dim"))
     if positions_incomplete or limits_incomplete:
         contents.append(Text("Risk incomplete: SL/data", style="yellow"))
     return Group(*contents)
@@ -337,13 +462,14 @@ def _trades_table(trades: tuple[TradeRow, ...], *, width: int) -> Any:
     for trade, source in trades:
         side_style = "green" if trade.position.side == "long" else "red"
         side = Text(trade.position.side.upper(), style=side_style)
+        symbol = Text(trade.position.symbol, style=_symbol_style(trade))
         if compact:
             asset = Text.assemble(
-                trade.position.symbol, " ", side, "\n", (source, "dim"), "\n", (_fmt_datetime(trade.opened_at), "dim")
+                symbol, " ", side, "\n", (source, "dim"), "\n", (_fmt_datetime(trade.opened_at), "dim")
             )
             cells = [str(trade.row_number), asset]
         else:
-            asset = Text.assemble(trade.position.symbol, "\n", (source, "dim"))
+            asset = Text.assemble(symbol, "\n", (source, "dim"))
             cells = [str(trade.row_number), asset, _fmt_datetime(trade.opened_at), side]
         table.add_row(*cells, Text(_risk_label(trade), style=_risk_style(trade)), _pnl_text(trade))
     return table
@@ -369,7 +495,12 @@ def _stacked_trades(trades: tuple[TradeRow, ...]) -> Any:
         side_style = "green" if trade.position.side == "long" else "red"
         rows.extend(
             (
-                Text.assemble(f"{trade.row_number} {trade.position.symbol} ", (trade.position.side.upper(), side_style)),
+                Text.assemble(
+                    f"{trade.row_number} ",
+                    (trade.position.symbol, _symbol_style(trade)),
+                    " ",
+                    (trade.position.side.upper(), side_style),
+                ),
                 Text(source, style="dim"),
                 Text.assemble("Risk ", (_risk_label(trade), _risk_style(trade))),
                 Text.assemble("UPNL ", _pnl_text(trade)),
@@ -380,28 +511,30 @@ def _stacked_trades(trades: tuple[TradeRow, ...]) -> Any:
 
 
 def _limit_orders_table(orders: tuple[OrderRow, ...], *, width: int) -> Any:
-    price_width = max(11, *(len(_fmt_price(order.price)) for order, _source in orders))
-    size_width = max(4, *(len(_fmt_decimal(order.remaining_base_amount)) for order, _source in orders))
+    price_width = max(11, *(len(_fmt_price(order.price)) for order, _source, _risk in orders))
+    size_width = max(4, *(len(_fmt_decimal(order.remaining_base_amount)) for order, _source, _risk in orders))
+    risk_width = max(4, *(len(_fmt_money(risk)) for _order, _source, risk in orders))
     asset_width = max(
         12,
         *(
             max(len(source), len(order.symbol) + len(order.side) + len(str(number)) + 2)
-            for number, (order, source) in enumerate(orders, start=1)
+            for number, (order, source, _risk) in enumerate(orders, start=1)
         ),
     )
     full_width = (
         max(1, *(len(str(number)) for number in range(1, len(orders) + 1)))
-        + max(5, *(max(len(order.symbol), len(source)) for order, source in orders))
-        + 4 + price_width + size_width + 6 + 12
+        + max(5, *(max(len(order.symbol), len(source)) for order, source, _risk in orders))
+        + 4 + price_width + size_width + risk_width + 6 + 14
     )
     compact = width < 68 or full_width > width
-    if compact and asset_width + price_width + size_width + 6 > width:
+    if compact and asset_width + price_width + size_width + risk_width + 8 > width:
         rows: list[Any] = []
-        for number, (order, source) in enumerate(orders, start=1):
+        for number, (order, source, risk) in enumerate(orders, start=1):
             rows.append(Text.assemble(f"{number} {order.symbol} ", (order.side.upper(), "green" if order.side == "buy" else "red")))
             rows.append(Text(source, style="dim"))
             rows.append(Text(f"Limit {_fmt_price(order.price)}"))
             rows.append(Text(f"Size {_fmt_decimal(order.remaining_base_amount)}"))
+            rows.append(Text.assemble("Risk ", (_fmt_money(risk), _risk_total_style(risk, False))))
             if order.reduce_only:
                 rows.append(Text("Reduce only", style="dim"))
         return Group(*rows)
@@ -414,9 +547,10 @@ def _limit_orders_table(orders: tuple[OrderRow, ...], *, width: int) -> Any:
         table.add_column("SIDE", no_wrap=True)
     table.add_column("LIMIT PRICE", justify="right", no_wrap=True)
     table.add_column("SIZE", justify="right", no_wrap=True)
+    table.add_column("RISK", justify="right", no_wrap=True)
     if not compact:
         table.add_column("REDUCE", no_wrap=True)
-    for number, (order, source) in enumerate(orders, start=1):
+    for number, (order, source, risk) in enumerate(orders, start=1):
         side = Text(order.side.upper(), style="green" if order.side == "buy" else "red")
         if compact:
             asset = Text.assemble(f"{number} {order.symbol} ", side, "\n", (source, "dim"))
@@ -426,6 +560,7 @@ def _limit_orders_table(orders: tuple[OrderRow, ...], *, width: int) -> Any:
         else:
             cells = [str(number), Text.assemble(order.symbol, "\n", (source, "dim")), side]
         cells.extend((Text(_fmt_price(order.price)), Text(_fmt_decimal(order.remaining_base_amount))))
+        cells.append(Text(_fmt_money(risk), style=_risk_total_style(risk, False)))
         if not compact:
             cells.append(Text("Yes" if order.reduce_only else "No", style="dim"))
         table.add_row(*cells)
@@ -447,7 +582,7 @@ def _source_label(account: AccountSnapshot, *, exchange: str | None = None) -> s
     if exchange == "bingx":
         return "BingX"
     name = "Lighter" if exchange == "lighter" else exchange
-    return f"{name} · {account.account.label}"
+    return _mask_dollar_literals(f"{name} · {account.account.label}")
 
 
 def _trade_rows(snapshot: TrackerSnapshot) -> tuple[TradeRow, ...]:
@@ -456,14 +591,22 @@ def _trade_rows(snapshot: TrackerSnapshot) -> tuple[TradeRow, ...]:
         for account in snapshot.accounts
         for trade in account.trades
     )
-    return tuple((replace(trade, row_number=number), source) for number, (trade, source) in enumerate(rows, start=1))
+    return tuple((replace(
+        trade,
+        row_number=number,
+        position=replace(trade.position, symbol=_mask_dollar_literals(trade.position.symbol)),
+    ), source) for number, (trade, source) in enumerate(rows, start=1))
 
 
 def _order_rows(snapshot: TrackerSnapshot) -> tuple[OrderRow, ...]:
+    # Row numbers are what the cancel prompt resolves, so share its ordering.
     return tuple(
-        (order, _source_label(account, exchange=order.exchange))
-        for account in snapshot.accounts
-        for order in account.limit_orders
+        (
+            replace(order, symbol=_mask_dollar_literals(order.symbol)),
+            _source_label(account, exchange=order.exchange),
+            limit_order_risk_usd(order, account),
+        )
+        for order, account in numbered_limit_orders(snapshot)
     )
 
 
@@ -515,7 +658,11 @@ def _notices(snapshot: TrackerSnapshot) -> list[str]:
         for trade in account.trades:
             if trade.risk_note and trade.risk_state not in {"locked", "auth-needed", "missing"}:
                 notices.append(f"{label} {trade.position.symbol}: {trade.risk_note}")
-    return notices
+    return [_mask_dollar_literals(notice) for notice in notices]
+
+
+def _mask_dollar_literals(value: str) -> str:
+    return _DOLLAR_AMOUNT.sub(_MASKED_AMOUNT, value) if _HIDE_AMOUNTS.get() else value
 
 
 def _short_notice(error: str) -> str:
@@ -536,9 +683,13 @@ def _risk_label(trade: ActiveTrade) -> str:
     return "n/a"
 
 
+def _symbol_style(trade: ActiveTrade) -> str:
+    return "cyan" if trade.profit_target_reached or trade.risk_usd == Decimal("0") else ""
+
+
 def _risk_style(trade: ActiveTrade) -> str:
     if trade.risk_usd == Decimal("0"):
-        return "green"
+        return "cyan"
     if trade.risk_usd is not None:
         return "white"
     return "yellow"
@@ -551,6 +702,8 @@ def _pnl_label(trade: ActiveTrade) -> str:
 def _fmt_pnl(pnl: Decimal | None) -> str:
     if pnl is None:
         return "n/a"
+    if _HIDE_AMOUNTS.get():
+        return _MASKED_AMOUNT
     return f"{'-' if pnl < 0 else '+'}{_fmt_money(abs(pnl))}"
 
 
@@ -575,6 +728,8 @@ def _fmt_price(value: Decimal) -> str:
 def _fmt_money(value: Decimal | None) -> str:
     if value is None:
         return "n/a"
+    if _HIDE_AMOUNTS.get():
+        return _MASKED_AMOUNT
     quantized = value.quantize(Decimal("0.01"))
     return f"${quantized:,.2f}"
 
